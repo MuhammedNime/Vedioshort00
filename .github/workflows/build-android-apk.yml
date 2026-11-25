@@ -1,0 +1,186 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    name: Build & Release Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: TypeScript check
+        run: npm run lint
+
+      - name: Build production web bundle
+        env:
+          VITE_BASE_PATH: '/'
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || secrets.VITE_API_BASE_URL || '' }}
+          VITE_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || '' }}
+          VITE_GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS || '' }}
+          VITE_GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 || '' }}
+          VITE_GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 || '' }}
+          VITE_GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 || '' }}
+          VITE_GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 || '' }}
+          VITE_GEMINI_API_KEY_5: ${{ secrets.GEMINI_API_KEY_5 || '' }}
+          VITE_GEMINI_API_KEY_6: ${{ secrets.GEMINI_API_KEY_6 || '' }}
+          VITE_GEMINI_API_KEY_7: ${{ secrets.GEMINI_API_KEY_7 || '' }}
+          VITE_GEMINI_API_KEY_8: ${{ secrets.GEMINI_API_KEY_8 || '' }}
+          VITE_GEMINI_API_KEY_9: ${{ secrets.GEMINI_API_KEY_9 || '' }}
+          VITE_GEMINI_API_KEY_10: ${{ secrets.GEMINI_API_KEY_10 || '' }}
+          VITE_GROQ_API_KEY: ${{ secrets.GROQ_API_KEY || '' }}
+          VITE_GROQ_API_KEYS: ${{ secrets.GROQ_API_KEYS || '' }}
+          VITE_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY || '' }}
+          VITE_OPENROUTER_API_KEYS: ${{ secrets.OPENROUTER_API_KEYS || '' }}
+          VITE_GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID || '' }}
+        run: npm run build
+
+      - name: Initialize & configure Capacitor Android project
+        run: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+          npx cap sync android
+
+          mkdir -p android/app/src/main/java/com/shortsquiz/studio0
+          cp android-native/MainActivity.java android/app/src/main/java/com/shortsquiz/studio0/MainActivity.java
+          mkdir -p android/app/src/main/res/xml
+          cp android-native/file_paths.xml android/app/src/main/res/xml/file_paths.xml
+
+          node -e '
+            const fs = require("fs");
+            const manifestPath = "android/app/src/main/AndroidManifest.xml";
+            let m = fs.readFileSync(manifestPath, "utf8");
+            if (!m.includes("android:usesCleartextTraffic")) {
+              m = m.replace("<application", "<application\n        android:usesCleartextTraffic=\"true\"");
+            }
+            if (!m.includes("android:launchMode")) {
+              m = m.replace("<activity", "<activity\n            android:launchMode=\"singleTask\"");
+            }
+            if (!m.includes("youtube-auth")) {
+              m = m.replace(
+                "</activity>",
+                "            <intent-filter>\n                <action android:name=\"android.intent.action.VIEW\" />\n                <category android:name=\"android.intent.category.DEFAULT\" />\n                <category android:name=\"android.intent.category.BROWSABLE\" />\n                <data android:scheme=\"com.shortsquiz.studio0\" android:host=\"youtube-auth\" />\n            </intent-filter>\n        </activity>"
+              );
+            }
+            const perms = [
+              "<uses-permission android:name=\"android.permission.RECORD_AUDIO\" />",
+              "<uses-permission android:name=\"android.permission.MODIFY_AUDIO_SETTINGS\" />",
+              "<uses-permission android:name=\"android.permission.WRITE_EXTERNAL_STORAGE\" android:maxSdkVersion=\"28\" />"
+            ];
+            for (const p of perms) {
+              const permName = p.match(/name="([^"]+)"/)[1];
+              if (!m.includes(permName)) {
+                m = m.replace("</manifest>", `    ${p}\n</manifest>`);
+              }
+            }
+            fs.writeFileSync(manifestPath, m);
+
+            const gradlePath = "android/app/build.gradle";
+            let g = fs.readFileSync(gradlePath, "utf8");
+            g = g.replace(/versionCode\s+\d+/, "versionCode ${{ github.run_number }}");
+            g = g.replace(/versionName\s+"[^"]*"/, "versionName \"1.0.${{ github.run_number }}\"");
+            if (!g.includes("signingConfigs")) {
+              const signingBlock = `    signingConfigs {\n        release {\n            if (System.getenv("ANDROID_KEYSTORE_PATH")) {\n                storeFile file(System.getenv("ANDROID_KEYSTORE_PATH"))\n                storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")\n                keyAlias System.getenv("ANDROID_KEY_ALIAS")\n                keyPassword System.getenv("ANDROID_KEY_PASSWORD")\n            }\n        }\n    }\n    buildTypes {`;
+              g = g.replace("    buildTypes {", signingBlock);
+              g = g.replace(
+                /buildTypes\s*\{\s*release\s*\{/,
+                "buildTypes {\n        release {\n            signingConfig System.getenv(\"ANDROID_KEYSTORE_PATH\") ? signingConfigs.release : signingConfigs.debug"
+              );
+            }
+            fs.writeFileSync(gradlePath, g);
+          '
+
+      - name: Copy app launcher icons to Android resources
+        run: |
+          for dir in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
+            mkdir -p "android/app/src/main/res/$dir"
+            cp public/pwa-192x192.png "android/app/src/main/res/$dir/ic_launcher.png"
+            cp public/pwa-maskable-512x512.png "android/app/src/main/res/$dir/ic_launcher_round.png"
+            cp public/pwa-512x512.png "android/app/src/main/res/$dir/ic_launcher_foreground.png"
+          done
+
+      - name: Build Android Debug & Release APKs
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 || '' }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || '' }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || '' }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > /tmp/release.keystore
+            export ANDROID_KEYSTORE_PATH="/tmp/release.keystore"
+          fi
+          chmod +x gradlew
+          ./gradlew assembleDebug assembleRelease --no-daemon
+          rm -f /tmp/release.keystore
+
+      - name: Prepare APK release files
+        run: |
+          mkdir -p release-apks
+          cp android/app/build/outputs/apk/debug/app-debug.apk release-apks/shorts-quiz-studio-debug.apk
+          if [ -f "android/app/build/outputs/apk/release/app-release.apk" ]; then
+            cp android/app/build/outputs/apk/release/app-release.apk release-apks/shorts-quiz-studio-release.apk
+          elif [ -f "android/app/build/outputs/apk/release/app-release-unsigned.apk" ]; then
+            cp android/app/build/outputs/apk/release/app-release-unsigned.apk release-apks/shorts-quiz-studio-release-unsigned.apk
+          fi
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shorts-quiz-studio-apk
+          path: release-apks/*.apk
+          retention-days: 30
+
+      - name: Determine Release Tag
+        id: release_meta
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "name=Release ${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "name=Latest APK Build (v1.0.${{ github.run_number }})" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          name: ${{ steps.release_meta.outputs.name }}
+          body: |
+            تم بناء تطبيق **استوديو شورتس الأسئلة (Shorts Quiz Studio)** تلقائياً (الإصدار `1.0.${{ github.run_number }}`):
+            - **`shorts-quiz-studio-release.apk`**: نسخة Release موقّعة جاهزة للتثبيت المباشر على أندرويد.
+            - **`shorts-quiz-studio-debug.apk`**: نسخة Debug للاختبار.
+          make_latest: true
+          files: |
+            release-apks/*.apk

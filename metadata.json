@@ -1,0 +1,6 @@
+{
+  "name": "استوديو شورتس الأسئلة",
+  "description": "استوديو صناعة فيديوهات يوتيوب شورتس للأسئلة والخيارات الأربعة مع الأصوات والحركات والتصدير المباشر.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

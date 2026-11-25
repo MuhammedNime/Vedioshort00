@@ -1,0 +1,207 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated studio user profile document used as parent gate for private question banks and folders.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID matching the document ID."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified Google account email address."
+        },
+        "displayName": {
+          "type": "string",
+          "description": "User or channel display name."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when user profile was first created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when user profile was last updated."
+        }
+      },
+      "required": ["uid", "email", "displayName", "createdAt", "updatedAt"]
+    },
+    "BankFolder": {
+      "title": "BankFolder",
+      "description": "Hierarchical nested folder for organizing questions (folders inside folders).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique folder identifier."
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID."
+        },
+        "name": {
+          "type": "string",
+          "description": "Folder display name."
+        },
+        "parentId": {
+          "type": "string",
+          "description": "Parent folder ID or empty string for root folders."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "general",
+            "discussion",
+            "sports",
+            "geography",
+            "science",
+            "history",
+            "islamic",
+            "technology",
+            "literature",
+            "math"
+          ],
+          "description": "Optional associated category."
+        },
+        "emoji": {
+          "type": "string",
+          "description": "Optional folder emoji icon."
+        },
+        "createdAt": {
+          "type": "integer",
+          "description": "Epoch milliseconds when created."
+        },
+        "serverUpdatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp enforced by Firestore security rules."
+        }
+      },
+      "required": ["id", "ownerId", "name", "parentId", "createdAt", "serverUpdatedAt"]
+    },
+    "BankQuestion": {
+      "title": "BankQuestion",
+      "description": "Categorized quiz question stored in the user's cloud question memory vault to prevent duplicates and track video conversion status.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique question document identifier."
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "general",
+            "discussion",
+            "sports",
+            "geography",
+            "science",
+            "history",
+            "islamic",
+            "technology",
+            "literature",
+            "math"
+          ],
+          "description": "Question category."
+        },
+        "slideType": {
+          "type": "string",
+          "enum": ["multiple", "multiple3", "trueFalse", "clues", "versus"],
+          "description": "Quiz slide format."
+        },
+        "badgeText": {
+          "type": "string",
+          "description": "Top badge label."
+        },
+        "question": {
+          "type": "string",
+          "description": "Main quiz question text."
+        },
+        "options": {
+          "type": "array",
+          "description": "Four option/clue slots."
+        },
+        "correctIndex": {
+          "type": "integer",
+          "description": "Zero-based index (0..3) of the correct option."
+        },
+        "explanationText": {
+          "type": "string",
+          "description": "Short explanation or engagement CTA."
+        },
+        "topicTag": {
+          "type": "string",
+          "description": "Subtopic tag from AI consultation."
+        },
+        "folderId": {
+          "type": "string",
+          "description": "Optional folder ID inside the hierarchical folder tree."
+        },
+        "folderPath": {
+          "type": "string",
+          "description": "Optional human-readable folder breadcrumb."
+        },
+        "usedInVideo": {
+          "type": "boolean",
+          "description": "Whether this question was converted into a video slide (green checkmark)."
+        },
+        "usedAt": {
+          "type": "integer",
+          "description": "Epoch milliseconds when marked used."
+        },
+        "createdAt": {
+          "type": "integer",
+          "description": "Epoch milliseconds when created."
+        },
+        "normalizedKey": {
+          "type": "string",
+          "description": "Normalized deduplication key."
+        },
+        "serverUpdatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp enforced by Firestore security rules."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "category",
+        "slideType",
+        "badgeText",
+        "question",
+        "options",
+        "correctIndex",
+        "explanationText",
+        "topicTag",
+        "usedInVideo",
+        "createdAt",
+        "normalizedKey",
+        "serverUpdatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private user profile documents keyed by Firebase Auth UID."
+    },
+    "/users/{userId}/folders/{folderId}": {
+      "schema": { "$ref": "#/entities/BankFolder" },
+      "description": "Per-user nested folders for organizing quiz questions."
+    },
+    "/users/{userId}/questions/{questionId}": {
+      "schema": { "$ref": "#/entities/BankQuestion" },
+      "description": "Per-user persistent question memory bank synced across web and APK."
+    }
+  }
+}

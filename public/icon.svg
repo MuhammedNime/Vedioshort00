@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#141816"/>
+      <stop offset="100%" stop-color="#090b0a"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#EDD6A2"/>
+      <stop offset="100%" stop-color="#d4a73a"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#00c85b"/>
+      <stop offset="100%" stop-color="#009944"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect x="24" y="24" width="464" height="464" rx="92" fill="none" stroke="#d4a73a" stroke-opacity="0.28" stroke-width="6"/>
+  <!-- 9:16 Shorts Frame -->
+  <rect x="136" y="76" width="240" height="360" rx="34" fill="#181c1a" stroke="url(#card)" stroke-width="10"/>
+  <!-- Question Bar -->
+  <rect x="162" y="108" width="188" height="62" rx="14" fill="url(#card)"/>
+  <rect x="192" y="130" width="128" height="16" rx="8" fill="#0c0c0c"/>
+  <!-- Correct Answer Option Row -->
+  <rect x="162" y="190" width="188" height="46" rx="12" fill="url(#green)"/>
+  <path d="M188 213 l9 9 l18 -20" fill="none" stroke="#ffffff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Remaining Options -->
+  <rect x="162" y="250" width="88" height="42" rx="11" fill="#272c29" stroke="#EDD6A2" stroke-opacity="0.35" stroke-width="3"/>
+  <rect x="262" y="250" width="88" height="42" rx="11" fill="#272c29" stroke="#EDD6A2" stroke-opacity="0.35" stroke-width="3"/>
+  <!-- Play / Timer Badge -->
+  <circle cx="256" cy="356" r="44" fill="#00B050"/>
+  <polygon points="244,336 278,356 244,376" fill="#ffffff"/>
+</svg>
