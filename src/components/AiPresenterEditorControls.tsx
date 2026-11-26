@@ -89,7 +89,14 @@ export const AiPresenterEditorControls: React.FC<AiPresenterEditorControlsProps>
           <span className="text-[11px] text-[var(--pmuted)] font-semibold">أين يظهر الراوي؟</span>
           <select
             value={aiPresenter.scope}
-            onChange={(e) => patch({ scope: e.target.value as AiPresenterScope })}
+            onChange={(e) => {
+              const nextScope = e.target.value as AiPresenterScope;
+              patch({
+                scope: nextScope,
+                afterSpeechBehavior:
+                  nextScope === 'fullTimeline' || nextScope === 'allSlides' ? 'stayIdle' : 'hide',
+              });
+            }}
             className="px-2.5 py-2 rounded-lg bg-[var(--panel)] border border-[var(--pline)] text-xs text-[var(--ptxt)] focus:border-[#00B050] focus:outline-none"
           >
             <option value="fullTimeline">طوال الفيديو (مستمر)</option>
@@ -107,6 +114,7 @@ export const AiPresenterEditorControls: React.FC<AiPresenterEditorControlsProps>
             onChange={(e) => patch({ placement: e.target.value as PresenterPlacement })}
             className="px-2.5 py-2 rounded-lg bg-[var(--panel)] border border-[var(--pline)] text-xs text-[var(--ptxt)] focus:border-[#00B050] focus:outline-none"
           >
+            <option value="bottomCenter">أسفل الوسط (ثابت أسفل الشاشة)</option>
             <option value="cornerBottomRight">أسفل اليمين</option>
             <option value="cornerBottomLeft">أسفل اليسار</option>
             <option value="topRight">أعلى اليمين</option>
@@ -115,6 +123,49 @@ export const AiPresenterEditorControls: React.FC<AiPresenterEditorControlsProps>
             <option value="floating">موضع حر (اسحبه بالمعاينة)</option>
           </select>
         </label>
+      </div>
+
+      {/* Continuous Visibility & Start Timing */}
+      <div className="grid grid-cols-2 gap-2">
+        <label className="flex flex-col gap-1">
+          <span className="text-[11px] text-[var(--pmuted)] font-semibold">بعد انتهاء كلام المقطع</span>
+          <select
+            value={
+              aiPresenter.afterSpeechBehavior ??
+              (aiPresenter.scope === 'fullTimeline' || aiPresenter.scope === 'allSlides'
+                ? 'stayIdle'
+                : 'hide')
+            }
+            onChange={(e) =>
+              patch({
+                afterSpeechBehavior: e.target.value as 'stayIdle' | 'loop' | 'hide',
+              })
+            }
+            className="px-2.5 py-2 rounded-lg bg-[var(--panel)] border border-[var(--pline)] text-xs text-[var(--ptxt)] focus:border-[#00B050] focus:outline-none"
+          >
+            <option value="stayIdle">يبقى ظاهراً على الشاشة</option>
+            <option value="loop">تكرار مستمر طوال العرض</option>
+            <option value="hide">يختفي فور الانتهاء</option>
+          </select>
+        </label>
+
+        {aiPresenter.scope === 'fullTimeline' && (
+          <label className="flex flex-col gap-1">
+            <span className="text-[11px] text-[var(--pmuted)] font-semibold">بدء كلام الراوي</span>
+            <select
+              value={aiPresenter.startPhase ?? 'timelineStart'}
+              onChange={(e) =>
+                patch({
+                  startPhase: e.target.value as 'timelineStart' | 'firstQuestion',
+                })
+              }
+              className="px-2.5 py-2 rounded-lg bg-[var(--panel)] border border-[var(--pline)] text-xs text-[var(--ptxt)] focus:border-[#00B050] focus:outline-none"
+            >
+              <option value="timelineStart">من بداية الفيديو (0:00)</option>
+              <option value="firstQuestion">عند بدء السؤال الأول</option>
+            </select>
+          </label>
+        )}
       </div>
 
       {aiPresenter.scope === 'slide' && (
@@ -367,22 +418,31 @@ export const AiPresenterEditorControls: React.FC<AiPresenterEditorControlsProps>
         </label>
       </div>
 
-      {/* Intro/Outro hero & badge toggles */}
+      {/* Intro/Outro hero & exclusive voice toggles */}
       <div className="flex flex-col gap-1.5 text-[11px]">
         <label className="flex items-center justify-between gap-2 cursor-pointer">
-          <span className="text-[var(--ptxt)] font-semibold">ظهور بملء الإطار في المقدمة (إن وُجدت)</span>
+          <span className="text-[var(--ptxt)] font-semibold">كتم أصوات القراءة الأخرى أثناء حديث الراوي</span>
           <input
             type="checkbox"
-            checked={aiPresenter.fullscreenInIntro !== false}
+            checked={aiPresenter.muteOtherVoices !== false}
+            onChange={(e) => patch({ muteOtherVoices: e.target.checked })}
+            className="w-4 h-4 accent-[#00B050] rounded cursor-pointer"
+          />
+        </label>
+        <label className="flex items-center justify-between gap-2 cursor-pointer">
+          <span className="text-[var(--ptxt)] font-semibold">تكبير الراوي في المقدمة (إن وُجدت)</span>
+          <input
+            type="checkbox"
+            checked={Boolean(aiPresenter.fullscreenInIntro)}
             onChange={(e) => patch({ fullscreenInIntro: e.target.checked })}
             className="w-4 h-4 accent-[#00B050] rounded cursor-pointer"
           />
         </label>
         <label className="flex items-center justify-between gap-2 cursor-pointer">
-          <span className="text-[var(--ptxt)] font-semibold">ظهور بملء الإطار في الخاتمة (إن وُجدت)</span>
+          <span className="text-[var(--ptxt)] font-semibold">تكبير الراوي في الخاتمة (إن وُجدت)</span>
           <input
             type="checkbox"
-            checked={aiPresenter.fullscreenInOutro !== false}
+            checked={Boolean(aiPresenter.fullscreenInOutro)}
             onChange={(e) => patch({ fullscreenInOutro: e.target.checked })}
             className="w-4 h-4 accent-[#00B050] rounded cursor-pointer"
           />

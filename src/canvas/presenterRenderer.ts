@@ -14,7 +14,11 @@ import {
   SlideSchedule,
   TemplateSettings,
 } from '../types/quiz';
-import { getCachedAiPresenterMedia, preloadAiPresenterMedia } from './aiPresenterMedia';
+import {
+  getAiPresenterSpeechEnvelope,
+  getCachedAiPresenterMedia,
+  preloadAiPresenterMedia,
+} from './aiPresenterMedia';
 
 export type PresenterPose = PresenterPoseId;
 
@@ -44,6 +48,7 @@ export interface PresenterChoreography {
   headNodY: number;
   handPhase: number;
   bubbleText: string;
+  activeOptionIndex?: number;
 }
 
 const ENVELOPE_RATE_HZ = 40;
@@ -352,10 +357,11 @@ export function getSpeechAmplitude(dataUrl: string | undefined, offsetSec: numbe
 }
 
 function syntheticSyllableWave(t: number): number {
-  const w1 = Math.max(0, Math.sin(t * 13.5));
-  const w2 = Math.max(0, Math.sin(t * 8.4 + 0.9));
-  const pause = Math.sin(t * 2.3) > -0.7 ? 1 : 0.08;
-  return clamp01((0.24 + 0.76 * w1 * (0.55 + 0.45 * w2)) * pause);
+  const syl1 = Math.max(0, Math.sin(t * 14.2));
+  const syl2 = Math.max(0, Math.sin(t * 9.1 + 0.85));
+  const stress = 0.65 + 0.35 * Math.sin(t * 4.4);
+  const pause = Math.sin(t * 2.15) > -0.76 ? 1 : 0.04;
+  return clamp01((0.26 + 0.74 * syl1 * (0.5 + 0.5 * syl2)) * stress * pause);
 }
 
 function computeBlinkState(globalTime: number): number {
@@ -460,10 +466,15 @@ export function computePresenterChoreography(
   phaseElapsed: number,
   slide?: QuestionSlide,
   schedule?: SlideSchedule,
-  localTime = 0
+  localTime = 0,
+  demoOverride?: {
+    forcedPose?: PresenterPose | null;
+    animClock?: number;
+  }
 ): PresenterChoreography {
-  const blinkClosed = computeBlinkState(globalTime);
-  const breathe = Math.sin(globalTime * 1.85);
+  const animClock = demoOverride?.animClock ?? globalTime;
+  const blinkClosed = computeBlinkState(animClock);
+  const breathe = Math.sin(animClock * 1.95);
   const expScale = clamp((template.presenterExpressiveness ?? 100) / 100, 0.2, 1.5);
   const lipSyncMode =
     template.presenterLipSyncMode ??
@@ -476,6 +487,7 @@ export function computePresenterChoreography(
   let gazeY = 0;
   let eyebrowLift = 0;
   let defaultBubbleText = '';
+  let activeOptionIndex: number | undefined = undefined;
 
   if (phase === 'intro') {
     const drv = resolveVoiceDriver(
@@ -486,7 +498,7 @@ export function computePresenterChoreography(
     );
     isSpeaking = drv.isSpeaking;
     speechEnergy = drv.speechEnergy;
-    eyebrowLift = 0.42 + 0.28 * speechEnergy;
+    eyebrowLift = 0.45 + 0.28 * speechEnergy;
     gazeX = 0;
     gazeY = -0.03;
   } else if (phase === 'outro') {
@@ -498,7 +510,7 @@ export function computePresenterChoreography(
     );
     isSpeaking = drv.isSpeaking;
     speechEnergy = drv.speechEnergy;
-    eyebrowLift = 0.5;
+    eyebrowLift = 0.52;
     gazeX = 0;
     gazeY = 0.05;
     defaultBubbleText = 'اشترك 🔔';
@@ -511,35 +523,76 @@ export function computePresenterChoreography(
     );
     isSpeaking = drv.isSpeaking;
     speechEnergy = drv.speechEnergy;
-    gazeX = -0.22;
-    gazeY = -0.2;
-    eyebrowLift = 0.28 + 0.24 * speechEnergy;
+    gazeX = -0.18;
+    gazeY = -0.22;
+    eyebrowLift = 0.3 + 0.25 * speechEnergy;
   } else if (phase === 'readingOptions' && slide && schedule) {
+    const optCount =
+      slide.slideType === 'trueFalse' || slide.slideType === 'versus'
+        ? 2
+        : slide.slideType === 'clues' || slide.slideType === 'multiple3'
+          ? 3
+          : 4;
     let activeOptIdx = 0;
     let activeOptElapsed = phaseElapsed;
-    for (let i = 3; i >= 0; i--) {
-      if (localTime >= schedule.tOptionStarts[i]) {
-        activeOptIdx = i;
-        activeOptElapsed = localTime - schedule.tOptionStarts[i];
-        break;
+    let matchedSeq = false;
+    let optCursor = schedule.tOptionStarts[0] ?? 0;
+
+    for (let i = 0; i < optCount; i++) {
+      const tOpt = schedule.tOptionStarts[i];
+      const oClip = slide.voiceover?.options?.[i];
+      const sameAsPrev = i > 0 && Math.abs(tOpt - schedule.tOptionStarts[i - 1]) < 0.01;
+      const isGroupedSame =
+        i < optCount - 1 && Math.abs(schedule.tOptionStarts[i + 1] - tOpt) < 0.01;
+      let groupEndBoundary = schedule.tThinkingStart;
+      for (let k = i + 1; k < optCount; k++) {
+        if (schedule.tOptionStarts[k] > tOpt + 0.01) {
+          groupEndBoundary = schedule.tOptionStarts[k];
+          break;
+        }
+      }
+      if (oClip?.dataUrl) {
+        const schedStart = isGroupedSame || sameAsPrev ? Math.max(tOpt, optCursor) : tOpt;
+        const maxBound = Math.max(schedStart + 0.15, groupEndBoundary - 0.02);
+        const clipDur = oClip.duration > 0.05 ? oClip.duration : 1.0;
+        const schedEnd = Math.min(maxBound, schedStart + clipDur + 0.04);
+        if (localTime >= schedStart && localTime <= schedEnd) {
+          activeOptIdx = i;
+          activeOptElapsed = localTime - schedStart;
+          matchedSeq = true;
+          break;
+        }
+        optCursor = schedEnd;
       }
     }
+
+    if (!matchedSeq) {
+      for (let i = optCount - 1; i >= 0; i--) {
+        if (localTime >= schedule.tOptionStarts[i]) {
+          activeOptIdx = i;
+          activeOptElapsed = localTime - schedule.tOptionStarts[i];
+          break;
+        }
+      }
+    }
+
+    activeOptionIndex = activeOptIdx;
     const optClip = slide.voiceover?.options?.[activeOptIdx];
     const drv = resolveVoiceDriver(
       optClip?.dataUrl,
       activeOptElapsed,
-      globalTime,
+      animClock,
       allowFallbackSpeech
     );
     isSpeaking = drv.isSpeaking;
     speechEnergy = drv.speechEnergy;
-    gazeX = activeOptIdx % 2 === 0 ? -0.32 : 0.26;
-    gazeY = 0.1;
-    eyebrowLift = 0.18 + 0.2 * speechEnergy;
+    gazeX = activeOptIdx % 2 === 0 ? 0.3 : -0.3;
+    gazeY = 0.08;
+    eyebrowLift = 0.22 + 0.22 * speechEnergy;
   } else if (phase === 'thinking') {
     isSpeaking = false;
     speechEnergy = 0;
-    gazeX = 0.36 * Math.sin(phaseElapsed * 0.75);
+    gazeX = 0.36 * Math.sin(phaseElapsed * 0.85);
     gazeY = -0.38;
     eyebrowLift = 0.22;
     defaultBubbleText = '؟';
@@ -548,7 +601,7 @@ export function computePresenterChoreography(
     speechEnergy = 0;
     gazeX = 0;
     gazeY = 0;
-    eyebrowLift = 0.58;
+    eyebrowLift = 0.62;
     defaultBubbleText = '⏳';
   } else if (phase === 'reveal') {
     const drv = resolveVoiceDriver(
@@ -561,11 +614,27 @@ export function computePresenterChoreography(
     speechEnergy = drv.speechEnergy;
     gazeX = 0;
     gazeY = -0.04;
-    eyebrowLift = 0.72;
+    eyebrowLift = 0.74;
     defaultBubbleText = '✓';
   }
 
-  const autoPose = resolveDefaultPhasePose(phase);
+  let autoPose = resolveDefaultPhasePose(phase);
+  if (phase === 'thinking' && schedule) {
+    const thinkingDur = Math.max(0.1, schedule.thinkingDuration);
+    const thinkingRemaining = Math.max(0, schedule.tSuspenseStart - localTime);
+    if (thinkingDur >= 3.0 && thinkingRemaining <= 1.85) {
+      autoPose = 'tapWatch';
+      defaultBubbleText = '⏳';
+    } else if (thinkingDur >= 4.2 && phaseElapsed > thinkingDur * 0.45) {
+      autoPose = 'thinkChin';
+    }
+  } else if (phase === 'readingOptions' && activeOptionIndex !== undefined) {
+    // Alternate between open conversational gestures and direct option pointing on later options
+    if (activeOptionIndex % 2 === 1 && phaseElapsed > 0.3) {
+      autoPose = 'pointSide';
+    }
+  }
+
   const templateCmd = template.presenterCommands?.[phase];
   const stagePose = resolveCommandPose(templateCmd, autoPose);
   const activeCue =
@@ -573,11 +642,32 @@ export function computePresenterChoreography(
       ? resolveActiveSlideCue(slide, phase, localTime)
       : null;
 
-  const pose: PresenterPose = activeCue ? activeCue.gesture : stagePose;
+  const pose: PresenterPose = demoOverride?.forcedPose
+    ? demoOverride.forcedPose
+    : activeCue
+      ? activeCue.gesture
+      : stagePose;
+
+  // When demonstrating a speaking gesture live in editor, ensure lips & speech energy animate cleanly
+  if (demoOverride?.forcedPose) {
+    const silentDemoPose =
+      pose === 'thinkForehead' ||
+      pose === 'thinkChin' ||
+      pose === 'tapWatch' ||
+      pose === 'leanSuspense';
+    if (silentDemoPose) {
+      isSpeaking = false;
+      speechEnergy = 0;
+    } else {
+      isSpeaking = true;
+      speechEnergy = syntheticSyllableWave(animClock);
+    }
+  }
+
   const isThinkingPose = pose === 'thinkForehead' || pose === 'thinkChin';
 
   const bubbleText =
-    activeCue?.bubbleText && activeCue.bubbleText.trim()
+    !demoOverride?.forcedPose && activeCue?.bubbleText && activeCue.bubbleText.trim()
       ? activeCue.bubbleText.trim()
       : isThinkingPose
         ? defaultBubbleText || '؟'
@@ -590,42 +680,47 @@ export function computePresenterChoreography(
               : defaultBubbleText;
 
   if (pose === 'pointUp') {
-    gazeX = 0;
+    gazeX = -0.08;
     gazeY = -0.45;
   } else if (pose === 'pointSide') {
-    gazeX = -0.45;
-    gazeY = 0.05;
+    const optSide = activeOptionIndex !== undefined && activeOptionIndex % 2 === 0 ? 1 : -1;
+    gazeX = optSide * 0.48;
+    gazeY = 0.08;
   } else if (pose === 'tapWatch') {
-    gazeX = -0.32;
-    gazeY = 0.28;
+    gazeX = -0.28;
+    gazeY = 0.34;
   } else if (isThinkingPose) {
-    gazeX = 0.34 * Math.sin(globalTime * 0.85);
+    gazeX = 0.34 * Math.sin(animClock * 0.9);
     gazeY = -0.42;
+  } else if (pose === 'celebrate') {
+    eyebrowLift = 0.78;
+    gazeX = 0;
+    gazeY = -0.04;
   }
 
-  const browFurrow = isThinkingPose ? 0.82 : pose === 'leanSuspense' ? 0.55 : 0;
+  const browFurrow = isThinkingPose ? 0.85 : pose === 'leanSuspense' ? 0.58 : 0;
 
   const mouthSpread = isSpeaking
-    ? clamp(Math.sin(globalTime * 11.4) * 0.55 + Math.cos(globalTime * 6.2) * 0.35, -1, 1)
+    ? clamp(Math.sin(animClock * 11.4) * 0.58 + Math.cos(animClock * 6.2) * 0.36, -0.85, 1)
     : pose === 'celebrate' || pose === 'waveSpeak' || pose === 'pointSubscribe'
-      ? 0.55
+      ? 0.58
       : isThinkingPose
         ? -0.15
         : 0.2;
 
   const headTiltRad =
     (pose === 'thinkForehead'
-      ? -0.085 + Math.sin(globalTime * 1.1) * 0.02
+      ? -0.09 + Math.sin(animClock * 1.15) * 0.022
       : pose === 'thinkChin'
-        ? -0.065 + Math.sin(globalTime * 1.15) * 0.022
+        ? -0.07 + Math.sin(animClock * 1.2) * 0.024
         : pose === 'waveSpeak' || pose === 'celebrate'
-          ? Math.sin(globalTime * 2.5) * 0.036 + speechEnergy * 0.024
+          ? Math.sin(animClock * 2.8) * 0.042 + speechEnergy * 0.026
           : pose === 'leanSuspense'
-            ? 0.035 + Math.sin(globalTime * 4.2) * 0.015
-            : Math.sin(globalTime * 1.5) * 0.022 + speechEnergy * 0.02) * expScale;
+            ? 0.04 + Math.sin(animClock * 4.4) * 0.018
+            : Math.sin(animClock * 1.65) * 0.025 + speechEnergy * 0.024) * expScale;
 
   const headNodY =
-    (breathe * 2.0 + (isSpeaking ? Math.sin(globalTime * 10.5) * speechEnergy * 3.8 : 0)) *
+    (breathe * 2.0 + (isSpeaking ? Math.sin(animClock * 10.8) * speechEnergy * 4.2 : 0)) *
     expScale;
 
   return {
@@ -643,8 +738,9 @@ export function computePresenterChoreography(
     breathe,
     headTiltRad,
     headNodY,
-    handPhase: globalTime,
+    handPhase: animClock,
     bubbleText,
+    activeOptionIndex,
   };
 }
 
@@ -1023,7 +1119,7 @@ function drawRiggedArm(
   showWatch: boolean,
   time: number
 ): void {
-  const { ex, ey, wx, wy } = solveTwoBoneIK(sx, sy, targetWx, targetWy, 62, 56, bendSign);
+  const { ex, ey, wx, wy } = solveTwoBoneIK(sx, sy, targetWx, targetWy, 66, 60, bendSign);
   const forearmAngle = Math.atan2(wy - ey, wx - ex);
 
   ctx.save();
@@ -1108,7 +1204,7 @@ function drawRealisticStudioHost(
   choreo: PresenterChoreography,
   talkIntensity: number
 ): void {
-  const s = Math.min(boxW / 280, boxH / 340);
+  const s = Math.min(boxW / 286, boxH / 334);
   const {
     pose,
     mouthOpen,
@@ -1124,6 +1220,7 @@ function drawRealisticStudioHost(
     handPhase,
     speechEnergy,
     isSpeaking,
+    activeOptionIndex,
   } = choreo;
 
   const gender: PresenterGender = template.presenterGender === 'female' ? 'female' : 'male';
@@ -1142,12 +1239,13 @@ function drawRealisticStudioHost(
     gender === 'female' ? 'none' : template.presenterBeard || 'trimmed';
   const hasGlasses = Boolean(template.presenterGlasses);
 
-  const leanZoom = pose === 'leanSuspense' ? 1.07 : 1.0;
-  const scaledOpen = clamp01(mouthOpen * (talkIntensity / 100) * 1.15);
-  const jawDropPx = scaledOpen * 5.2;
+  const leanZoom = pose === 'leanSuspense' ? 1.09 : 1.0;
+  const scaledOpen = clamp01(mouthOpen * (talkIntensity / 100) * 1.24);
+  const jawDropPx = scaledOpen * 5.8;
+  const torsoSpeechBob = isSpeaking ? -speechEnergy * 2.4 : 0;
 
   ctx.save();
-  ctx.translate(cx, cy + boxH * 0.08 + breathe * 2.4 * s);
+  ctx.translate(cx, cy + boxH * 0.045 + (breathe * 2.2 + torsoSpeechBob) * s);
   ctx.scale(s * leanZoom, s * leanZoom);
 
   // Studio Three-Point Rim & Key Glow Behind Presenter
@@ -1719,25 +1817,25 @@ function drawRealisticStudioHost(
     y: -56 + headNodY + hx * sinT + hy * cosT,
   });
 
-  const leftShoulder = { x: gender === 'female' ? -64 : -70, y: 46 };
-  const rightShoulder = { x: gender === 'female' ? 64 : 70, y: 46 };
+  const leftShoulder = { x: gender === 'female' ? -62 : -68, y: 40 };
+  const rightShoulder = { x: gender === 'female' ? 62 : 68, y: 40 };
 
   if (pose === 'thinkForehead') {
-    // Viewer-right arm lifts cleanly so fingers rest directly on right forehead/temple!
-    const templeTarget = headToBody(33, -36);
+    // Viewer-right arm lifts cleanly so fingers rest directly on temple/forehead; left supports across chest
+    const templeTarget = headToBody(31, -34);
     drawRiggedArm(
       ctx,
       leftShoulder.x,
       leftShoulder.y,
-      -52,
-      136,
+      -24,
+      66,
       1,
       suitColor,
       suitShadow,
       skin,
       'relaxed',
       1,
-      0.1,
+      0.35,
       true,
       handPhase
     );
@@ -1758,20 +1856,20 @@ function drawRealisticStudioHost(
       handPhase
     );
   } else if (pose === 'thinkChin') {
-    const chinTarget = headToBody(14, 52 + jawDropPx);
+    const chinTarget = headToBody(14, 48 + jawDropPx);
     drawRiggedArm(
       ctx,
       leftShoulder.x,
       leftShoulder.y,
-      -52,
-      136,
+      -26,
+      66,
       1,
       suitColor,
       suitShadow,
       skin,
       'relaxed',
       1,
-      0.1,
+      0.38,
       true,
       handPhase
     );
@@ -1793,20 +1891,21 @@ function drawRealisticStudioHost(
     );
   } else if (pose === 'waveSpeak') {
     const waveSway = Math.sin(handPhase * 7.2) * 14;
-    const waveBob = Math.cos(handPhase * 7.2) * 5;
+    const waveBob = Math.cos(handPhase * 7.2) * 6;
+    const speakBobR = Math.sin(handPhase * 4.8) * (4 + mouthOpen * 6);
     drawRiggedArm(
       ctx,
       leftShoulder.x,
       leftShoulder.y,
-      -96 + waveSway,
-      -14 + waveBob,
+      -94 + waveSway,
+      -20 + waveBob,
       1,
       suitColor,
       suitShadow,
       skin,
       'open',
       1,
-      Math.sin(handPhase * 7.2) * 0.25,
+      Math.sin(handPhase * 7.2) * 0.28,
       true,
       handPhase
     );
@@ -1815,14 +1914,14 @@ function drawRealisticStudioHost(
       rightShoulder.x,
       rightShoulder.y,
       58,
-      132,
+      64 - speakBobR,
       -1,
       suitColor,
       suitShadow,
       skin,
-      'relaxed',
+      'open',
       -1,
-      0,
+      -0.22,
       false,
       handPhase
     );
@@ -1832,8 +1931,8 @@ function drawRealisticStudioHost(
       ctx,
       leftShoulder.x,
       leftShoulder.y,
-      -88,
-      -22 + bob,
+      -86,
+      -28 + bob,
       1,
       suitColor,
       suitShadow,
@@ -1848,67 +1947,103 @@ function drawRealisticStudioHost(
       ctx,
       rightShoulder.x,
       rightShoulder.y,
-      56,
-      134,
+      58,
+      66 + bob * 0.45,
       -1,
       suitColor,
       suitShadow,
       skin,
-      'relaxed',
+      'open',
       -1,
-      0,
+      -0.25,
       false,
       handPhase
     );
   } else if (pose === 'pointSide') {
-    const bob = Math.sin(handPhase * 6.2) * 8;
-    drawRiggedArm(
-      ctx,
-      leftShoulder.x,
-      leftShoulder.y,
-      -114 + bob,
-      58,
-      1,
-      suitColor,
-      suitShadow,
-      skin,
-      'point',
-      1,
-      -Math.PI / 2,
-      true,
-      handPhase
-    );
-    drawRiggedArm(
-      ctx,
-      rightShoulder.x,
-      rightShoulder.y,
-      56,
-      134,
-      -1,
-      suitColor,
-      suitShadow,
-      skin,
-      'relaxed',
-      -1,
-      0,
-      false,
-      handPhase
-    );
+    const bob = Math.sin(handPhase * 6.4) * 8;
+    const pointRightSide = activeOptionIndex !== undefined && activeOptionIndex % 2 === 0;
+    if (pointRightSide) {
+      drawRiggedArm(
+        ctx,
+        leftShoulder.x,
+        leftShoulder.y,
+        -52,
+        66 - bob * 0.4,
+        1,
+        suitColor,
+        suitShadow,
+        skin,
+        'open',
+        1,
+        0.24,
+        true,
+        handPhase
+      );
+      drawRiggedArm(
+        ctx,
+        rightShoulder.x,
+        rightShoulder.y,
+        104 + bob,
+        32,
+        -1,
+        suitColor,
+        suitShadow,
+        skin,
+        'point',
+        -1,
+        Math.PI / 2,
+        false,
+        handPhase
+      );
+    } else {
+      drawRiggedArm(
+        ctx,
+        leftShoulder.x,
+        leftShoulder.y,
+        -104 + bob,
+        32,
+        1,
+        suitColor,
+        suitShadow,
+        skin,
+        'point',
+        1,
+        -Math.PI / 2,
+        true,
+        handPhase
+      );
+      drawRiggedArm(
+        ctx,
+        rightShoulder.x,
+        rightShoulder.y,
+        52,
+        66 - bob * 0.4,
+        -1,
+        suitColor,
+        suitShadow,
+        skin,
+        'open',
+        -1,
+        -0.24,
+        false,
+        handPhase
+      );
+    }
   } else if (pose === 'tapWatch') {
-    const tapBob = Math.sin(handPhase * 8.5) * 4;
+    const tapBob = Math.abs(Math.sin(handPhase * 9.2)) * -7;
     drawRiggedArm(
       ctx,
       leftShoulder.x,
       leftShoulder.y,
-      -26,
-      98,
+      -16,
+      48,
       1,
       suitColor,
       suitShadow,
       skin,
-      'relaxed',
+      'open',
       1,
-      0.35,
+      0.55,
       true,
       handPhase
     );
@@ -1916,26 +2051,26 @@ function drawRealisticStudioHost(
       ctx,
       rightShoulder.x,
       rightShoulder.y,
-      12,
-      94 + tapBob,
+      8,
+      38 + tapBob,
       -1,
       suitColor,
       suitShadow,
       skin,
       'point',
       -1,
-      -0.8,
+      -0.95,
       false,
       handPhase
     );
   } else if (pose === 'celebrate') {
-    const pump = Math.sin(handPhase * 8.0) * 10;
+    const pump = Math.sin(handPhase * 8.2) * 11;
     drawRiggedArm(
       ctx,
       leftShoulder.x,
       leftShoulder.y,
-      -92,
-      -10 - pump,
+      -88,
+      -20 - pump,
       1,
       suitColor,
       suitShadow,
@@ -1950,8 +2085,8 @@ function drawRealisticStudioHost(
       ctx,
       rightShoulder.x,
       rightShoulder.y,
-      92,
-      -10 - pump,
+      88,
+      -20 - pump,
       -1,
       suitColor,
       suitShadow,
@@ -1963,20 +2098,20 @@ function drawRealisticStudioHost(
       handPhase
     );
   } else if (pose === 'pointSubscribe') {
-    const bob = Math.sin(handPhase * 5.8) * 7;
+    const bob = Math.sin(handPhase * 6.0) * 7;
     drawRiggedArm(
       ctx,
       leftShoulder.x,
       leftShoulder.y,
-      -42,
-      126 + bob,
+      -58,
+      62 + bob,
       1,
       suitColor,
       suitShadow,
       skin,
       'point',
       1,
-      Math.PI * 0.92,
+      Math.PI * 0.72,
       true,
       handPhase
     );
@@ -1984,32 +2119,33 @@ function drawRealisticStudioHost(
       ctx,
       rightShoulder.x,
       rightShoulder.y,
-      46,
-      122 - bob * 0.5,
+      68,
+      22 - bob * 0.7,
       -1,
       suitColor,
       suitShadow,
       skin,
       'open',
       -1,
-      0.25,
+      0.18,
       false,
       handPhase
     );
   } else if (pose === 'leanSuspense') {
+    const sway = Math.sin(handPhase * 5.2) * 4;
     drawRiggedArm(
       ctx,
       leftShoulder.x,
       leftShoulder.y,
-      -24,
-      118,
+      -28,
+      54 + sway,
       1,
       suitColor,
       suitShadow,
       skin,
       'open',
       1,
-      0.65,
+      0.58,
       true,
       handPhase
     );
@@ -2017,35 +2153,39 @@ function drawRealisticStudioHost(
       ctx,
       rightShoulder.x,
       rightShoulder.y,
-      24,
-      118,
+      28,
+      54 + sway,
       -1,
       suitColor,
       suitShadow,
       skin,
       'open',
       -1,
-      -0.65,
+      -0.58,
       false,
       handPhase
     );
   } else {
-    // 'explain' (conversational open two-hand speaking gestures synced to speechEnergy)
-    const gBobL = Math.sin(handPhase * 4.8) * (4 + mouthOpen * 9);
-    const gBobR = Math.cos(handPhase * 4.8) * (4 + mouthOpen * 9);
+    // 'explain' (lively upper-chest two-hand speaking & option-presenting gestures inside visible frame)
+    const gBobL = Math.sin(handPhase * 5.2) * (5 + mouthOpen * 10);
+    const gBobR = Math.cos(handPhase * 5.2) * (5 + mouthOpen * 10);
+    const optBias =
+      activeOptionIndex !== undefined ? (activeOptionIndex % 2 === 0 ? 1 : -1) : 0;
+    const twistL = Math.sin(handPhase * 4.8) * 0.16;
+    const twistR = -Math.cos(handPhase * 4.8) * 0.16;
     drawRiggedArm(
       ctx,
       leftShoulder.x,
       leftShoulder.y,
-      -74,
-      102 - gBobL,
+      -78 - mouthOpen * 6,
+      58 - gBobL - (optBias < 0 ? 12 : 0),
       1,
       suitColor,
       suitShadow,
       skin,
       'open',
       1,
-      0.32,
+      0.24 + twistL,
       true,
       handPhase
     );
@@ -2053,15 +2193,15 @@ function drawRealisticStudioHost(
       ctx,
       rightShoulder.x,
       rightShoulder.y,
-      74,
-      102 - gBobR,
+      78 + mouthOpen * 6,
+      58 - gBobR - (optBias > 0 ? 12 : 0),
       -1,
       suitColor,
       suitShadow,
       skin,
       'open',
       -1,
-      -0.32,
+      -0.24 + twistR,
       false,
       handPhase
     );
@@ -2294,6 +2434,9 @@ export function resolveSlidePresenterRect(
   if (placement === 'floating') {
     centerX = ((template.presenterX ?? 84) / 100) * W;
     centerY = ((template.presenterY ?? 79) / 100) * H;
+  } else if (placement === 'bottomCenter') {
+    centerX = W / 2;
+    centerY = H - h / 2 - (isWide ? 22 : 34);
   } else if (placement === 'cornerBottomRight') {
     centerX = W - w / 2 - (isWide ? 34 : 26);
     centerY = H - h / 2 - (isWide ? 28 : 42);
@@ -2559,6 +2702,9 @@ export function resolveAiPresenterRect(
   if (placement === 'floating') {
     centerX = ((ai.x ?? 82) / 100) * W;
     centerY = ((ai.y ?? 78) / 100) * H;
+  } else if (placement === 'bottomCenter') {
+    centerX = W / 2;
+    centerY = H - h / 2 - (isWide ? 20 : 32);
   } else if (placement === 'cornerBottomRight') {
     centerX = W - w / 2 - (isWide ? 32 : 24);
     centerY = H - h / 2 - (isWide ? 26 : 38);
@@ -2637,17 +2783,29 @@ export function drawAiPresenterVideoFrame(
   fontStack: string,
   options?: {
     isFullscreenHero?: boolean;
+    videoTimeSec?: number;
+    globalTime?: number;
+    isIdleAfterSpeech?: boolean;
   }
 ): void {
   const { x, y, w, h } = rect;
   const cx = x + w / 2;
   const cy = y + h / 2;
   const isHero = Boolean(options?.isFullscreenHero);
+  const isIdle = Boolean(options?.isIdleAfterSpeech);
   const shape: PresenterFrameShape = isHero ? 'broadcastCard' : ai.frameShape || 'cutout';
   const media = getCachedAiPresenterMedia(ai.mediaKey);
   if (!media) {
     void preloadAiPresenterMedia(ai);
   }
+  const speechAmp = isIdle
+    ? 0
+    : getAiPresenterSpeechEnvelope(
+        ai.mediaKey,
+        options?.videoTimeSec ?? media?.videoEl.currentTime ?? 0
+      );
+  const isActivelySpeaking = !isIdle && speechAmp > 0.08 && (ai.volume ?? 1) > 0.02;
+  const waveClock = options?.globalTime ?? options?.videoTimeSec ?? media?.videoEl.currentTime ?? 0;
   const customBgImg =
     ai.bgMode === 'customImage' && ai.customBgDataUrl
       ? getCachedPortrait(ai.customBgDataUrl)
@@ -2681,17 +2839,38 @@ export function drawAiPresenterVideoFrame(
 
   const paintVideoContent = (containMode: boolean) => {
     if (media && media.ready && media.videoEl.readyState >= 2) {
-      drawCoverImageOrVideo(
-        ctx,
-        media.videoEl,
-        media.videoEl.videoWidth || media.width,
-        media.videoEl.videoHeight || media.height,
-        x,
-        y,
-        w,
-        h,
-        containMode
-      );
+      if (isIdle) {
+        const breatheScale = 1 + 0.008 * Math.sin(waveClock * 2.1);
+        const swayY = Math.sin(waveClock * 1.4) * Math.max(1, h * 0.004);
+        ctx.save();
+        ctx.translate(cx, y + h);
+        ctx.scale(breatheScale, breatheScale);
+        ctx.translate(-cx, -(y + h) + swayY);
+        drawCoverImageOrVideo(
+          ctx,
+          media.videoEl,
+          media.videoEl.videoWidth || media.width,
+          media.videoEl.videoHeight || media.height,
+          x,
+          y,
+          w,
+          h,
+          containMode
+        );
+        ctx.restore();
+      } else {
+        drawCoverImageOrVideo(
+          ctx,
+          media.videoEl,
+          media.videoEl.videoWidth || media.width,
+          media.videoEl.videoHeight || media.height,
+          x,
+          y,
+          w,
+          h,
+          containMode
+        );
+      }
     } else {
       ctx.fillStyle = 'rgba(15, 23, 42, 0.72)';
       ctx.fillRect(x, y, w, h);
@@ -2706,13 +2885,17 @@ export function drawAiPresenterVideoFrame(
 
   ctx.save();
 
+  const speakingStroke = isActivelySpeaking
+    ? '#00E676'
+    : template.questionBorderColor || '#D4A73A';
+
   if (shape === 'circleCam') {
     const rad = Math.min(w, h) / 2;
     ctx.save();
     ctx.beginPath();
     ctx.arc(cx, cy, rad, 0, Math.PI * 2);
-    ctx.shadowColor = 'rgba(0, 0, 0, 0.55)';
-    ctx.shadowBlur = 22;
+    ctx.shadowColor = isActivelySpeaking ? 'rgba(0, 230, 118, 0.55)' : 'rgba(0, 0, 0, 0.55)';
+    ctx.shadowBlur = isActivelySpeaking ? 26 + speechAmp * 14 : 22;
     ctx.fillStyle = ai.bgMode === 'transparent' ? 'rgba(0,0,0,0.01)' : '#0b1120';
     ctx.fill();
     ctx.clip();
@@ -2723,10 +2906,22 @@ export function drawAiPresenterVideoFrame(
     ctx.save();
     ctx.beginPath();
     ctx.arc(cx, cy, rad, 0, Math.PI * 2);
-    ctx.strokeStyle = template.questionBorderColor || '#D4A73A';
-    ctx.lineWidth = 4.5;
+    ctx.strokeStyle = speakingStroke;
+    ctx.lineWidth = isActivelySpeaking ? 4.5 + speechAmp * 3.5 : 4.5;
     ctx.stroke();
     ctx.restore();
+
+    if ((ai.volume ?? 1) > 0.02) {
+      drawBroadcastEqualizer(
+        ctx,
+        cx - 12,
+        y + h - 18,
+        4,
+        isActivelySpeaking ? Math.max(0.28, speechAmp) : 0.06,
+        waveClock,
+        isActivelySpeaking ? '#00E676' : '#EDD6A2'
+      );
+    }
   } else if (shape === 'cutout') {
     ctx.save();
     drawRoundedPath(ctx, x, y, w, h, 26);
@@ -2734,12 +2929,24 @@ export function drawAiPresenterVideoFrame(
     paintBackground();
     paintVideoContent(ai.bgMode === 'transparent');
     ctx.restore();
+
+    if (isActivelySpeaking) {
+      drawBroadcastEqualizer(
+        ctx,
+        cx - 12,
+        y + h - 16,
+        4,
+        Math.max(0.26, speechAmp),
+        waveClock,
+        '#00E676'
+      );
+    }
   } else {
     const radius = isHero ? 38 : 26;
     ctx.save();
     drawRoundedPath(ctx, x, y, w, h, radius);
-    ctx.shadowColor = 'rgba(0, 0, 0, 0.55)';
-    ctx.shadowBlur = isHero ? 36 : 20;
+    ctx.shadowColor = isActivelySpeaking ? 'rgba(0, 230, 118, 0.45)' : 'rgba(0, 0, 0, 0.55)';
+    ctx.shadowBlur = isActivelySpeaking ? (isHero ? 40 : 26) : isHero ? 36 : 20;
     ctx.shadowOffsetY = 8;
     ctx.fillStyle = ai.bgMode === 'transparent' ? 'rgba(9,17,36,0.22)' : '#091124';
     ctx.fill();
@@ -2747,16 +2954,16 @@ export function drawAiPresenterVideoFrame(
     paintBackground();
     paintVideoContent(false);
 
+    const barH = isHero ? 70 : 42;
+    const barGrad = ctx.createLinearGradient(x, y + h - barH - 12, x, y + h);
+    barGrad.addColorStop(0, 'rgba(6, 10, 22, 0)');
+    barGrad.addColorStop(1, 'rgba(6, 10, 22, 0.88)');
+    ctx.fillStyle = barGrad;
+    ctx.fillRect(x, y + h - barH - 12, w, barH + 12);
+
     if (ai.showNameBadge) {
       const pName = (ai.displayName || ai.replicaName || '').trim();
       if (pName) {
-        const barH = isHero ? 70 : 42;
-        const barGrad = ctx.createLinearGradient(x, y + h - barH - 12, x, y + h);
-        barGrad.addColorStop(0, 'rgba(6, 10, 22, 0)');
-        barGrad.addColorStop(1, 'rgba(6, 10, 22, 0.9)');
-        ctx.fillStyle = barGrad;
-        ctx.fillRect(x, y + h - barH - 12, w, barH + 12);
-
         ctx.font = `800 ${isHero ? 26 : 16}px ${fontStack}`;
         ctx.direction = 'rtl';
         ctx.textAlign = 'right';
@@ -2765,12 +2972,24 @@ export function drawAiPresenterVideoFrame(
         ctx.fillText(pName, x + w - (isHero ? 24 : 14), y + h - (isHero ? 28 : 18));
       }
     }
+
+    if ((ai.volume ?? 1) > 0.02) {
+      drawBroadcastEqualizer(
+        ctx,
+        x + (isHero ? 26 : 14),
+        y + h - (isHero ? 28 : 18),
+        isHero ? 6 : 4,
+        isActivelySpeaking ? Math.max(0.28, speechAmp) : 0.06,
+        waveClock,
+        isActivelySpeaking ? '#00E676' : '#EDD6A2'
+      );
+    }
     ctx.restore();
 
     ctx.save();
     drawRoundedPath(ctx, x, y, w, h, radius);
-    ctx.strokeStyle = template.questionBorderColor || '#D4A73A';
-    ctx.lineWidth = isHero ? 4.5 : 3;
+    ctx.strokeStyle = speakingStroke;
+    ctx.lineWidth = isHero ? (isActivelySpeaking ? 5.5 : 4.5) : isActivelySpeaking ? 4 : 3;
     ctx.stroke();
     ctx.restore();
   }

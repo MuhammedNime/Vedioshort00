@@ -188,6 +188,79 @@
         "normalizedKey",
         "serverUpdatedAt"
       ]
+    },
+    "CloudProject": {
+      "title": "CloudProject",
+      "description": "Synced quiz video project metadata and lightweight JSON snapshot stored per user.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique project identifier." },
+        "ownerId": { "type": "string", "description": "Owner Firebase Auth UID." },
+        "name": { "type": "string", "description": "Project display name." },
+        "schemaVersion": { "type": "integer", "description": "Project schema version integer." },
+        "preferredAiVoice": {
+          "type": "string",
+          "enum": ["Kore", "Puck", "Charon", "Fenrir", "Zephyr"],
+          "description": "Preferred Gemini TTS voice."
+        },
+        "aspectRatio": {
+          "type": "string",
+          "enum": ["9:16", "16:9"],
+          "description": "Video canvas aspect ratio."
+        },
+        "slideCount": { "type": "integer", "description": "Number of quiz slides in the project." },
+        "projectJson": {
+          "type": "string",
+          "description": "Compact serialized project JSON without oversized inline binary assets."
+        },
+        "updatedAt": { "type": "integer", "description": "Client timestamp of last edit." },
+        "serverUpdatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp enforced by Firestore security rules."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "name",
+        "schemaVersion",
+        "preferredAiVoice",
+        "aspectRatio",
+        "slideCount",
+        "projectJson",
+        "updatedAt",
+        "serverUpdatedAt"
+      ]
+    },
+    "CloudStylePreset": {
+      "title": "CloudStylePreset",
+      "description": "Saved custom template style preset synced across web and Android APK.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique preset identifier." },
+        "ownerId": { "type": "string", "description": "Owner Firebase Auth UID." },
+        "name": { "type": "string", "description": "Custom preset name." },
+        "createdAt": { "type": "integer", "description": "Creation epoch ms." },
+        "updatedAt": { "type": "integer", "description": "Last update epoch ms." },
+        "includesMedia": { "type": "boolean", "description": "Whether preset originally included media." },
+        "presetJson": { "type": "string", "description": "Compact serialized style preset JSON." },
+        "serverUpdatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp enforced by Firestore security rules."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "name",
+        "createdAt",
+        "updatedAt",
+        "includesMedia",
+        "presetJson",
+        "serverUpdatedAt"
+      ]
     }
   },
   "firestore": {
@@ -202,6 +275,14 @@
     "/users/{userId}/questions/{questionId}": {
       "schema": { "$ref": "#/entities/BankQuestion" },
       "description": "Per-user persistent question memory bank synced across web and APK."
+    },
+    "/users/{userId}/projects/{projectId}": {
+      "schema": { "$ref": "#/entities/CloudProject" },
+      "description": "Per-user synced quiz video projects across web and Android APK."
+    },
+    "/users/{userId}/presets/{presetId}": {
+      "schema": { "$ref": "#/entities/CloudStylePreset" },
+      "description": "Per-user synced custom template style presets."
     }
   }
 }

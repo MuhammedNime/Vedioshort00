@@ -6,6 +6,7 @@ import {
   mergeCustomPresetsVault,
 } from './customPresets';
 import {
+  hydrateProjectMedia,
   idbGet,
   listProjectsFromStore,
   normalizeLoadedProject,
@@ -36,14 +37,14 @@ export async function buildFullStudioBackup(
 
   const summaries = await listProjectsFromStore();
   const projectsMap = new Map<string, QuizProject>();
-  projectsMap.set(currentProject.id, normalizeLoadedProject(currentProject));
+  projectsMap.set(currentProject.id, await hydrateProjectMedia(normalizeLoadedProject(currentProject)));
 
   for (const s of summaries) {
     if (projectsMap.has(s.id)) continue;
     try {
       const raw = await idbGet<Partial<QuizProject>>(`project_item_${s.id}`);
       if (raw && Array.isArray(raw.slides) && raw.slides.length > 0) {
-        projectsMap.set(s.id, normalizeLoadedProject(raw));
+        projectsMap.set(s.id, await hydrateProjectMedia(normalizeLoadedProject(raw)));
       }
     } catch {
       // skip unreadable entries

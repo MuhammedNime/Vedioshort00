@@ -35,12 +35,16 @@ import {
 import {
   decodeAiPresenterAudioBuffer,
   getAiPresenterPlaybackWindows,
+  isTimeCoveredByAiPresenterAudio,
   pauseAllCachedAiPresenterVideos,
   preloadAiPresenterMedia,
+  prepareAiPresenterPlaybackAt,
+  subscribeAiPresenterFrameReady,
   syncAiPresenterPreviewVideo,
 } from '../canvas/aiPresenterMedia';
 import {
   AudioSettings,
+  PresenterPoseId,
   QuestionSlide,
   TemplateSettings,
   TimingSettings,
@@ -65,6 +69,116 @@ interface ShortsPreviewStageProps {
   onCycleChannelTheme: () => void;
   onActiveSlideChange?: (idx: number) => void;
   onUpdateTemplate?: (next: TemplateSettings) => void;
+}
+
+type StagePhaseId = 'intro' | 'question' | 'opt1' | 'opt4' | 'timer' | 'suspense' | 'reveal' | 'end';
+
+function computeActivePhaseId(
+  t: number,
+  slides: QuestionSlide[],
+  template: TemplateSettings,
+  timing: TimingSettings,
+  audio: AudioSettings
+): StagePhaseId | null {
+  const introDur = getIntroHookDuration(template, timing);
+  if (introDur > 0 && t < introDur) return 'intro';
+  const contentEnd = getSlidesContentDuration(slides, timing, audio, template);
+  if (template.showEndCard && t >= contentEnd) return 'end';
+  const info = getSlideTimeInfo(t, slides, timing, audio, template);
+  if (!info) return null;
+  const { localTime, schedule } = info;
+  if (localTime < schedule.tOptionStarts[0]) return 'question';
+  if (localTime < (schedule.tOptionStarts[1] ?? schedule.tThinkingStart)) return 'opt1';
+  if (localTime < schedule.tThinkingStart) return 'opt4';
+  if (localTime < schedule.tTimerExitStart) return 'timer';
+  if (localTime < schedule.tRevealStart) return 'suspense';
+  return 'reveal';
+}
+
+function applyExactClipDurations(
+  slides: QuestionSlide[],
+  audio: AudioSettings,
+  template: TemplateSettings
+): { slides: QuestionSlide[]; audio: AudioSettings; template: TemplateSettings } {
+  const syncClip = <T extends { dataUrl?: string; duration: number } | undefined>(clip: T): T => {
+    if (!clip?.dataUrl) return clip;
+    const exact = soundEngine.getExactDuration(clip.dataUrl, clip.duration);
+    return Math.abs(exact - clip.duration) > 0.01 ? ({ ...clip, duration: exact } as T) : clip;
+  };
+
+  let slidesChanged = false;
+  const nextSlides = slides.map((s) => {
+    if (!s.voiceover) return s;
+    const q = syncClip(s.voiceover.question);
+    const ans = syncClip(s.voiceover.answer);
+    const opts = s.voiceover.options
+      ? ([
+          syncClip(s.voiceover.options[0]),
+          syncClip(s.voiceover.options[1]),
+          syncClip(s.voiceover.options[2]),
+          syncClip(s.voiceover.options[3]),
+        ] as [
+          typeof s.voiceover.question,
+          typeof s.voiceover.question,
+          typeof s.voiceover.question,
+          typeof s.voiceover.question
+        ])
+      : undefined;
+    const optsChanged =
+      opts &&
+      s.voiceover.options &&
+      (opts[0] !== s.voiceover.options[0] ||
+        opts[1] !== s.voiceover.options[1] ||
+        opts[2] !== s.voiceover.options[2] ||
+        opts[3] !== s.voiceover.options[3]);
+    if (q !== s.voiceover.question || ans !== s.voiceover.answer || optsChanged) {
+      slidesChanged = true;
+      return {
+        ...s,
+        voiceover: {
+          ...s.voiceover,
+          question: q,
+          answer: ans,
+          options: opts,
+        },
+      };
+    }
+    return s;
+  });
+
+  const syncSlot = <T extends AudioSettings[keyof AudioSettings]>(cfg: T): T => {
+    if (cfg.sourceType !== 'custom' || !cfg.customDataUrl) return cfg;
+    const exact = soundEngine.getExactDuration(cfg.customDataUrl, cfg.duration ?? 0);
+    return exact > 0 && Math.abs(exact - (cfg.duration ?? 0)) > 0.01
+      ? ({ ...cfg, duration: exact } as T)
+      : cfg;
+  };
+
+  const nextAudio: AudioSettings = {
+    questionEnter: syncSlot(audio.questionEnter),
+    optionEnter: syncSlot(audio.optionEnter),
+    countdownTick: syncSlot(audio.countdownTick),
+    suspense: syncSlot(audio.suspense),
+    correctReveal: syncSlot(audio.correctReveal),
+    bgMusic: syncSlot(audio.bgMusic),
+  };
+
+  const nextIntroHookAudio = syncClip(template.introHookAudio);
+  const nextEndCardAudio = syncClip(template.endCardAudio);
+  const nextTemplate =
+    nextIntroHookAudio !== template.introHookAudio || nextEndCardAudio !== template.endCardAudio
+      ? {
+          ...template,
+          introHookAudio: nextIntroHookAudio,
+          endCardAudio: nextEndCardAudio,
+        }
+      : template;
+
+  return {
+    slides: slidesChanged ? nextSlides : slides,
+    audio: nextAudio,
+    template: nextTemplate,
+  };
 }
 
 function formatTimecode(sec: number): string {
@@ -138,6 +252,9 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
   dragModeRef.current = dragMode;
   activeDragTargetRef.current = activeDragTarget;
 
+  const demoPoseRef = useRef<PresenterPoseId | null>(null);
+  const demoAnimClockRef = useRef<number>(0);
+
   const drawPreviewFrame = (
     ctx: CanvasRenderingContext2D,
     t: number,
@@ -150,6 +267,7 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
       syncAiPresenterPreviewVideo(t, false, s, tpl, tm, au, isMutedRef.current, true);
     }
     const nextHitboxes: StageElementHitbox[] = [];
+    const hasInteractiveOverride = Boolean(dragModeRef.current || demoPoseRef.current);
     renderQuizFrame(
       ctx,
       t,
@@ -158,8 +276,13 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
       tm,
       au,
       true,
-      dragModeRef.current
-        ? { dragMode: true, activeTarget: activeDragTargetRef.current }
+      hasInteractiveOverride
+        ? {
+            dragMode: dragModeRef.current,
+            activeTarget: dragModeRef.current ? activeDragTargetRef.current : null,
+            demoPresenterPose: demoPoseRef.current,
+            demoPresenterAnimClock: demoAnimClockRef.current,
+          }
         : undefined,
       nextHitboxes
     );
@@ -242,15 +365,107 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
   }, [slides, timing, audio, template, activeSlideIndex, totalDuration]);
 
   useEffect(() => {
+    const unsubscribe = subscribeAiPresenterFrameReady(() => {
+      if (isPlayingRef.current) return;
+      const canvas = canvasRef.current;
+      const ctx = canvas?.getContext('2d', { alpha: false });
+      if (ctx) {
+        drawPreviewFrame(ctx, timeRef.current);
+      }
+    });
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    let rafId = 0;
+    const handlePresenterDemo = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ pose?: PresenterPoseId }>).detail;
+      if (!detail?.pose) return;
+      cancelAnimationFrame(rafId);
+      demoPoseRef.current = detail.pose;
+      const startPerf = performance.now();
+      const durationMs = 2600;
+
+      const step = (now: number) => {
+        const elapsedSec = (now - startPerf) / 1000;
+        demoAnimClockRef.current = elapsedSec;
+        const canvas = canvasRef.current;
+        const ctx = canvas?.getContext('2d', { alpha: false });
+        if (ctx && !isPlayingRef.current) {
+          drawPreviewFrame(ctx, timeRef.current);
+        }
+        if (now - startPerf < durationMs && demoPoseRef.current === detail.pose) {
+          rafId = requestAnimationFrame(step);
+        } else {
+          demoPoseRef.current = null;
+          if (ctx && !isPlayingRef.current) {
+            drawPreviewFrame(ctx, timeRef.current);
+          }
+        }
+      };
+
+      rafId = requestAnimationFrame(step);
+    };
+
+    window.addEventListener('shortvedio:presenter-demo', handlePresenterDemo);
+    return () => {
+      cancelAnimationFrame(rafId);
+      demoPoseRef.current = null;
+      window.removeEventListener('shortvedio:presenter-demo', handlePresenterDemo);
+    };
+  }, []);
+
+  const prevAiPresenterSigRef = useRef<string>('');
+  useEffect(() => {
+    const ai = template.aiPresenter;
+    const sig = ai?.enabled ? `${ai.mediaKey}:${ai.scope}:${ai.targetSlideIndex ?? 0}` : '';
+    const changed = prevAiPresenterSigRef.current !== sig;
+    prevAiPresenterSigRef.current = sig;
+
+    if (changed && ai?.enabled && !isPlayingRef.current) {
+      const windows = getAiPresenterPlaybackWindows(slides, template, timing, audio);
+      if (windows.length > 0) {
+        const cur = timeRef.current;
+        const alreadyVisible = windows.some(
+          (w) => cur >= w.timelineStart && cur <= w.timelineEnd
+        );
+        if (!alreadyVisible) {
+          const target = Math.min(
+            totalDuration,
+            windows[0].timelineStart + Math.min(0.2, Math.max(0.05, (windows[0].timelineEnd - windows[0].timelineStart) * 0.2))
+          );
+          syncTimeUi(target, totalDuration, true);
+        }
+      }
+    }
+  }, [template, slides, timing, audio, totalDuration]);
+
+  useEffect(() => {
     if (totalDuration > 0 && timeRef.current > totalDuration) {
       syncTimeUi(totalDuration, totalDuration, true);
     }
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext('2d', { alpha: false });
-    if (ctx) {
+    if (ctx && mobileStageMode !== 'collapsed') {
       drawPreviewFrame(ctx, timeRef.current, slides, template, timing, audio);
     }
-  }, [slides, template, timing, audio, totalDuration, canvasW, canvasH, dragMode, activeDragTarget]);
+  }, [slides, template, timing, audio, totalDuration, canvasW, canvasH, dragMode, activeDragTarget, mobileStageMode]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      if (isPlayingRef.current) return;
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const ctx = canvas.getContext('2d', { alpha: false });
+      if (ctx) {
+        drawPreviewFrame(ctx, timeRef.current);
+      }
+    });
+    ro.observe(canvas);
+    return () => ro.disconnect();
+  }, []);
 
   const prevSlideIdxRef = useRef(activeSlideIndex);
   useEffect(() => {
@@ -290,22 +505,25 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
     const isStale = () => canceled || !isPlayingRef.current || playSessionRef.current !== sessionId;
 
     const startPlayback = async () => {
-      let activeSlides = slidesRef.current;
-      let activeAudio = audioRef.current;
-      let activeTemplate = templateRef.current;
+      const audioCtx = await soundEngine.unlock();
+      if (isStale()) return;
 
-      const synced = await soundEngine.syncProjectAudioDurations(
+      await soundEngine.syncProjectAudioDurations(
+        slidesRef.current,
+        audioRef.current,
+        templateRef.current,
+        audioCtx
+      );
+      if (isStale()) return;
+
+      const initialSynced = applyExactClipDurations(
         slidesRef.current,
         audioRef.current,
         templateRef.current
       );
-      if (isStale()) return;
-      activeSlides = synced.slides;
-      activeAudio = synced.audio;
-      activeTemplate = synced.template;
 
       if (!isMutedRef.current) {
-        void soundEngine.startBgMusic(activeAudio.bgMusic).then((src) => {
+        void soundEngine.startBgMusic(initialSynced.audio.bgMusic).then((src) => {
           if (isStale() && src) {
             soundEngine.stopBgMusic();
           }
@@ -314,14 +532,20 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
 
       // Hydrate & pre-decode AI Presenter video audio for accurate synced live preview
       let aiPresenterAudioBuf: AudioBuffer | null = null;
-      const aiPres = activeTemplate.aiPresenter;
+      const aiPres = initialSynced.template.aiPresenter;
       const triggeredAiWinIndices = new Set<number>();
       if (aiPres?.enabled && aiPres.mediaKey) {
         await preloadAiPresenterMedia(aiPres);
         if (!isStale()) {
-          aiPresenterAudioBuf = await decodeAiPresenterAudioBuffer(
-            aiPres.mediaKey,
-            soundEngine.getContext()
+          aiPresenterAudioBuf = await decodeAiPresenterAudioBuffer(aiPres.mediaKey, audioCtx);
+        }
+        if (!isStale()) {
+          await prepareAiPresenterPlaybackAt(
+            timeRef.current,
+            initialSynced.slides,
+            initialSynced.template,
+            timingRef.current,
+            initialSynced.audio
           );
         }
       }
@@ -331,16 +555,43 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
       let rafId = 0;
       const startMediaTime = timeRef.current;
       const startPerfMs = performance.now();
+      let audioBaseCtxSec: number | null =
+        audioCtx.state === 'running' ? audioCtx.currentTime : null;
       let lastUiSyncPerf = startPerfMs;
+      let lastSyncedPhase: StagePhaseId | null = computeActivePhaseId(
+        startMediaTime,
+        initialSynced.slides,
+        initialSynced.template,
+        timingRef.current,
+        initialSynced.audio
+      );
       let isFirstTick = true;
+
+      if (initialSynced.template.aiPresenter?.enabled && initialSynced.template.aiPresenter.mediaKey) {
+        syncAiPresenterPreviewVideo(
+          startMediaTime,
+          true,
+          initialSynced.slides,
+          initialSynced.template,
+          timingRef.current,
+          initialSynced.audio,
+          isMutedRef.current,
+          Boolean(aiPresenterAudioBuf)
+        );
+      }
 
       const tick = (now: number) => {
         if (isStale()) return;
 
-        const useSynced = activeSlides.length === slidesRef.current.length;
-        const curSlides = useSynced ? activeSlides : slidesRef.current;
-        const curAudio = useSynced ? activeAudio : audioRef.current;
-        const curTemplate = useSynced ? activeTemplate : templateRef.current;
+        // Read live editor props with exact decoded clip durations so screen stays responsive mid-playback
+        const liveSynced = applyExactClipDurations(
+          slidesRef.current,
+          audioRef.current,
+          templateRef.current
+        );
+        const curSlides = liveSynced.slides;
+        const curAudio = liveSynced.audio;
+        const curTemplate = liveSynced.template;
 
         const rawPrevT = timeRef.current;
         const useFirstMargin = isFirstTick || forceFirstTickRef.current;
@@ -349,7 +600,15 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
         isFirstTick = false;
         forceFirstTickRef.current = false;
 
-        let nextT = startMediaTime + Math.max(0, (now - startPerfMs) / 1000);
+        if (audioBaseCtxSec === null && audioCtx.state === 'running') {
+          audioBaseCtxSec = audioCtx.currentTime - Math.max(0, (now - startPerfMs) / 1000);
+        }
+        const elapsedSec =
+          audioBaseCtxSec !== null && audioCtx.state === 'running'
+            ? Math.max(0, audioCtx.currentTime - audioBaseCtxSec)
+            : Math.max(0, (now - startPerfMs) / 1000);
+
+        let nextT = startMediaTime + elapsedSec;
         const maxDur = getTotalDuration(curSlides, timingRef.current, curAudio, curTemplate);
 
         if (nextT >= maxDur) {
@@ -407,7 +666,7 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
                     undefined,
                     undefined,
                     undefined,
-                    'voice'
+                    'aiPresenter'
                   );
                 }
               }
@@ -424,6 +683,13 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
             curAudio,
             curTemplate
           );
+          const aiVoiceOwnsAudioHere = isTimeCoveredByAiPresenterAudio(
+            nextT,
+            curSlides,
+            curTemplate,
+            timingRef.current,
+            curAudio
+          );
           const duckIfNeeded = (durSec: number) => {
             if (timingRef.current.autoDuckMusic !== false && durSec > 0.25) {
               soundEngine.duckBgMusic(undefined, durSec, timingRef.current.bgMusicDuckRatio ?? 0.22);
@@ -432,25 +698,25 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
 
           for (const ev of events) {
             const s = curSlides[ev.slideIndex];
-            const maxDur = ev.maxDuration;
+            const maxDurEv = ev.maxDuration;
             if (ev.type === 'introHook') {
               const hookSfx = curTemplate.introHookSfx ?? 'whoosh';
-              const hasHookVoice = Boolean(curTemplate.introHookAudio?.dataUrl);
+              const hasHookVoice = Boolean(curTemplate.introHookAudio?.dataUrl) && !aiVoiceOwnsAudioHere;
               if (hookSfx && hookSfx !== 'none') {
                 const ctx = soundEngine.getContext();
                 soundEngine.playBuiltInSfx(
                   hookSfx,
-                  hasHookVoice ? 0.42 : 0.72,
+                  aiVoiceOwnsAudioHere ? 0.28 : hasHookVoice ? 0.42 : 0.72,
                   ctx,
                   ctx.destination,
                   ctx.currentTime,
                   false,
                   1.6,
-                  hasHookVoice ? Math.min(0.28, maxDur ?? 0.28) : maxDur
+                  aiVoiceOwnsAudioHere || hasHookVoice ? Math.min(0.24, maxDurEv ?? 0.24) : maxDurEv
                 );
               }
-              if (curTemplate.introHookAudio?.dataUrl) {
-                const dur = Math.min(maxDur ?? 99, curTemplate.introHookAudio.duration || 1.2);
+              if (curTemplate.introHookAudio?.dataUrl && !aiVoiceOwnsAudioHere) {
+                const dur = Math.min(maxDurEv ?? 99, curTemplate.introHookAudio.duration || 1.2);
                 duckIfNeeded(dur);
                 void soundEngine.playClip(
                   curTemplate.introHookAudio,
@@ -459,12 +725,12 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
                   undefined,
                   undefined,
                   'voice',
-                  maxDur
+                  maxDurEv
                 );
               }
             } else if (ev.type === 'questionEnter') {
-              if (s?.voiceover?.question?.dataUrl) {
-                const dur = Math.min(maxDur ?? 99, s.voiceover.question.duration || 1.2);
+              if (s?.voiceover?.question?.dataUrl && !aiVoiceOwnsAudioHere) {
+                const dur = Math.min(maxDurEv ?? 99, s.voiceover.question.duration || 1.2);
                 duckIfNeeded(dur);
                 void soundEngine.playClip(
                   s.voiceover.question,
@@ -473,22 +739,22 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
                   undefined,
                   undefined,
                   'voice',
-                  maxDur
+                  maxDurEv
                 );
               } else {
                 soundEngine.stopActiveVoice();
-                void soundEngine.playSlot(curAudio.questionEnter, undefined, undefined, undefined, false, maxDur);
+                void soundEngine.playSlot(curAudio.questionEnter, undefined, undefined, undefined, false, maxDurEv);
               }
             } else if (ev.type === 'optionEnter') {
               const oIdx = ev.optionIndex ?? 0;
               const oClip = s?.voiceover?.options?.[oIdx];
-              if (oClip?.dataUrl) {
-                const dur = Math.min(maxDur ?? 99, oClip.duration || 1.0);
+              if (oClip?.dataUrl && !aiVoiceOwnsAudioHere) {
+                const dur = Math.min(maxDurEv ?? 99, oClip.duration || 1.0);
                 duckIfNeeded(dur);
-                void soundEngine.playClip(oClip, 1, undefined, undefined, undefined, 'voice', maxDur);
+                void soundEngine.playClip(oClip, 1, undefined, undefined, undefined, 'voice', maxDurEv);
               } else {
                 soundEngine.stopActiveVoice();
-                void soundEngine.playSlot(curAudio.optionEnter, undefined, undefined, undefined, false, maxDur);
+                void soundEngine.playSlot(curAudio.optionEnter, undefined, undefined, undefined, false, maxDurEv);
               }
             } else if (ev.type === 'countdownTick') {
               void soundEngine.playSlot(
@@ -497,7 +763,7 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
                 undefined,
                 undefined,
                 !!ev.urgent,
-                maxDur ?? 0.88
+                maxDurEv ?? 0.88
               );
             } else if (ev.type === 'suspense') {
               void soundEngine.playSlot(
@@ -506,12 +772,12 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
                 undefined,
                 undefined,
                 false,
-                maxDur ?? Math.max(0.25, timingRef.current.suspenseDuration ?? 1.6),
+                maxDurEv ?? Math.max(0.25, timingRef.current.suspenseDuration ?? 1.6),
                 timingRef.current.suspenseDuration
               );
             } else if (ev.type === 'correctReveal') {
-              if (s?.voiceover?.answer?.dataUrl) {
-                const dur = Math.min(maxDur ?? 99, s.voiceover.answer.duration || 1.2);
+              if (s?.voiceover?.answer?.dataUrl && !aiVoiceOwnsAudioHere) {
+                const dur = Math.min(maxDurEv ?? 99, s.voiceover.answer.duration || 1.2);
                 duckIfNeeded(dur);
                 void soundEngine.playClip(
                   s.voiceover.answer,
@@ -520,15 +786,15 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
                   undefined,
                   undefined,
                   'voice',
-                  maxDur
+                  maxDurEv
                 );
               } else {
                 soundEngine.stopActiveVoice();
-                void soundEngine.playSlot(curAudio.correctReveal, undefined, undefined, undefined, false, maxDur);
+                void soundEngine.playSlot(curAudio.correctReveal, undefined, undefined, undefined, false, maxDurEv);
               }
             } else if (ev.type === 'endCardEnter') {
-              if (curTemplate.endCardAudio?.dataUrl) {
-                const dur = Math.min(maxDur ?? 99, curTemplate.endCardAudio.duration || 2.0);
+              if (curTemplate.endCardAudio?.dataUrl && !aiVoiceOwnsAudioHere) {
+                const dur = Math.min(maxDurEv ?? 99, curTemplate.endCardAudio.duration || 2.0);
                 duckIfNeeded(dur);
                 void soundEngine.playClip(
                   curTemplate.endCardAudio,
@@ -537,16 +803,25 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
                   undefined,
                   undefined,
                   'voice',
-                  maxDur
+                  maxDurEv
                 );
               }
             }
           }
         }
 
-        const shouldSyncReact = now - lastUiSyncPerf >= 250;
+        const nextPhase = computeActivePhaseId(
+          nextT,
+          curSlides,
+          curTemplate,
+          timingRef.current,
+          curAudio
+        );
+        const phaseChanged = nextPhase !== lastSyncedPhase;
+        const shouldSyncReact = phaseChanged || now - lastUiSyncPerf >= 85;
         if (shouldSyncReact) {
           lastUiSyncPerf = now;
+          lastSyncedPhase = nextPhase;
         }
         syncTimeUi(nextT, maxDur, shouldSyncReact);
 
@@ -599,7 +874,7 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
   }, [isPlaying, onActiveSlideChange]);
 
   const handleTogglePlay = () => {
-    soundEngine.getContext();
+    void soundEngine.unlock();
     if (
       !isPlaying &&
       (!hasUserScrubbedRef.current ||
@@ -626,7 +901,7 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
   };
 
   const handleRestart = () => {
-    soundEngine.getContext();
+    void soundEngine.unlock();
     soundEngine.stopAllSfxAndVoice();
     hasUserScrubbedRef.current = true;
     isExternallySelectedSlideRef.current = false;
@@ -641,7 +916,7 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
   };
 
   const handlePlayCurrentSlide = () => {
-    soundEngine.getContext();
+    void soundEngine.unlock();
     soundEngine.stopAllSfxAndVoice();
     const schedules = computeProjectTimeline(slides, timing, audio, template);
     const sched = schedules[activeSlideIndex] ?? schedules[0];
@@ -659,7 +934,7 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
     const schedules = computeProjectTimeline(slides, timing, audio, template);
     const sched = schedules[nextIdx];
     if (sched && onActiveSlideChange) {
-      soundEngine.getContext();
+      void soundEngine.unlock();
       soundEngine.stopAllSfxAndVoice();
       hasUserScrubbedRef.current = true;
       isExternallySelectedSlideRef.current = false;
@@ -834,6 +1109,7 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
   };
 
   const handleToggleMute = () => {
+    void soundEngine.unlock();
     setIsMuted((prev) => {
       const next = !prev;
       if (next) {
@@ -910,21 +1186,13 @@ export const ShortsPreviewStage: React.FC<ShortsPreviewStageProps> = ({
     }
   };
 
-  const activePhaseId: 'intro' | 'question' | 'opt1' | 'opt4' | 'timer' | 'suspense' | 'reveal' | 'end' | null = (() => {
-    const introDur = getIntroHookDuration(template, timing);
-    if (introDur > 0 && currentTime < introDur) return 'intro';
-    const contentEnd = getSlidesContentDuration(slides, timing, audio, template);
-    if (template.showEndCard && currentTime >= contentEnd) return 'end';
-    const info = getSlideTimeInfo(currentTime, slides, timing, audio, template);
-    if (!info) return null;
-    const { localTime, schedule } = info;
-    if (localTime < schedule.tOptionStarts[0]) return 'question';
-    if (localTime < (schedule.tOptionStarts[1] ?? schedule.tThinkingStart)) return 'opt1';
-    if (localTime < schedule.tThinkingStart) return 'opt4';
-    if (localTime < schedule.tTimerExitStart) return 'timer';
-    if (localTime < schedule.tRevealStart) return 'suspense';
-    return 'reveal';
-  })();
+  const activePhaseId: StagePhaseId | null = computeActivePhaseId(
+    currentTime,
+    slides,
+    template,
+    timing,
+    audio
+  );
 
   const currentPhaseLabel = (() => {
     if (activePhaseId === 'intro') return 'المقدمة';

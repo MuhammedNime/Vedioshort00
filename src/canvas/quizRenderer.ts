@@ -7,6 +7,7 @@ import {
   ImageFitMode,
   OptionImagePlacement,
   PRESET_BACKDROPS,
+  PresenterPoseId,
   QuestionImageInsideLayout,
   QuestionImagePlacement,
   QuestionSlide,
@@ -34,6 +35,7 @@ import {
   resolveAiPresenterRect,
   resolveSlidePresenterRect,
 } from './presenterRenderer';
+import { computeActiveCaptionState, drawDynamicCaptionsOverlay } from './captionsRenderer';
 
 export const CANVAS_WIDTH = 1080;
 export const CANVAS_HEIGHT = 1920;
@@ -68,6 +70,8 @@ export interface StageElementHitbox {
 export interface InteractiveStageState {
   dragMode?: boolean;
   activeTarget?: DragTargetId | null;
+  demoPresenterPose?: PresenterPoseId | null;
+  demoPresenterAnimClock?: number;
 }
 
 export interface SlideTimeInfo {
@@ -3434,7 +3438,16 @@ export function renderQuizFrame(
         globalTime,
         template,
         'intro',
-        globalTime
+        globalTime,
+        undefined,
+        undefined,
+        0,
+        interactiveState?.demoPresenterPose
+          ? {
+              forcedPose: interactiveState.demoPresenterPose,
+              animClock: interactiveState.demoPresenterAnimClock,
+            }
+          : undefined
       );
       ctx.save();
       ctx.globalAlpha = alpha;
@@ -3446,7 +3459,7 @@ export function renderQuizFrame(
       const heroW = isWide ? Math.round(W * 0.34) : Math.round(W * 0.72);
       const heroH = isWide ? Math.round(H * 0.74) : Math.round(H * 0.44);
       const heroX = isWide ? Math.round(W * 0.07) : Math.round((W - heroW) / 2);
-      const heroY = isWide ? Math.round((H - heroH) / 2) : Math.round(H * 0.13);
+      const heroY = isWide ? Math.round((H - heroH) / 2) : Math.round(H - heroH - H * 0.055);
 
       if (useAiIntroHero && template.aiPresenter) {
         drawAiPresenterVideoFrame(
@@ -3455,7 +3468,12 @@ export function renderQuizFrame(
           template.aiPresenter,
           { x: heroX, y: heroY, w: heroW, h: heroH },
           fontStack,
-          { isFullscreenHero: true }
+          {
+            isFullscreenHero: true,
+            videoTimeSec: aiIntroTiming?.videoTimeSec,
+            globalTime,
+            isIdleAfterSpeech: aiIntroTiming?.isIdleAfterSpeech,
+          }
         );
       } else {
         drawPresenterHostFrame(
@@ -3468,7 +3486,7 @@ export function renderQuizFrame(
         );
       }
 
-      // Hook Caption Card beside (16:9) or below (9:16) hero presenter
+      // Hook Caption Card beside (16:9) or above (9:16) bottom-anchored hero presenter
       const cardW = isWide ? Math.round(W * 0.48) : Math.min(W - 84, 920);
       ctx.font = `900 ${isWide ? 56 : 54}px ${fontStack}`;
       ctx.direction = 'rtl';
@@ -3476,7 +3494,7 @@ export function renderQuizFrame(
       const lineH = isWide ? 76 : 74;
       const cardH = Math.max(190, lines.length * lineH + 74);
       const cardCX = isWide ? W * 0.71 : W / 2;
-      const cardCY = isWide ? H / 2 : heroY + heroH + 46 + cardH / 2;
+      const cardCY = isWide ? H / 2 : Math.max(cardH / 2 + 120, heroY - 46 - cardH / 2);
 
       ctx.save();
       ctx.translate(cardCX, cardCY);
@@ -3558,7 +3576,11 @@ export function renderQuizFrame(
     drawBrandWatermark(ctx, template, globalTime, W, H, fontStack);
     if (aiIntroTiming && template.aiPresenter?.enabled && !aiIntroTiming.isFullscreenHero) {
       const pRect = resolveAiPresenterRect(template.aiPresenter, W, H, template.aspectRatio);
-      drawAiPresenterVideoFrame(ctx, template, template.aiPresenter, pRect, fontStack);
+      drawAiPresenterVideoFrame(ctx, template, template.aiPresenter, pRect, fontStack, {
+        videoTimeSec: aiIntroTiming.videoTimeSec,
+        globalTime,
+        isIdleAfterSpeech: aiIntroTiming.isIdleAfterSpeech,
+      });
     }
     ctx.restore();
     return;
@@ -3592,7 +3614,16 @@ export function renderQuizFrame(
         globalTime,
         template,
         'outro',
-        endElapsed
+        endElapsed,
+        undefined,
+        undefined,
+        0,
+        interactiveState?.demoPresenterPose
+          ? {
+              forcedPose: interactiveState.demoPresenterPose,
+              animClock: interactiveState.demoPresenterAnimClock,
+            }
+          : undefined
       );
       ctx.save();
       ctx.globalAlpha = alpha;
@@ -3600,16 +3631,16 @@ export function renderQuizFrame(
       const heroW = isWide ? Math.round(W * 0.33) : Math.round(W * 0.68);
       const heroH = isWide ? Math.round(H * 0.74) : Math.round(H * 0.43);
       const heroX = isWide ? Math.round(W * 0.07) : Math.round((W - heroW) / 2);
-      const heroY = isWide ? Math.round((H - heroH) / 2) : Math.round(H * 0.14);
+      const heroY = isWide ? Math.round((H - heroH) / 2) : Math.round(H - heroH - H * 0.05);
 
       const endCardW = isWide ? Math.round(W * 0.49) : Math.min(W - 84, 920);
       const endCardH = isWide ? 470 : 490;
       const cardCX = isWide ? W * 0.71 : W / 2;
-      const cardCY = isWide ? H / 2 : heroY + heroH + 46 + endCardH / 2;
+      const cardCY = isWide ? H / 2 : Math.max(endCardH / 2 + 120, heroY - 46 - endCardH / 2);
 
       const ctaRelY = 82;
       const targetBtnX = isWide ? cardCX : W / 2;
-      const targetBtnY = isWide ? cardCY + ctaRelY - 58 : heroY + heroH + 14;
+      const targetBtnY = isWide ? cardCY + ctaRelY - 58 : cardCY + ctaRelY;
 
       if (useAiOutroHero && template.aiPresenter) {
         drawAiPresenterVideoFrame(
@@ -3618,7 +3649,12 @@ export function renderQuizFrame(
           template.aiPresenter,
           { x: heroX, y: heroY, w: heroW, h: heroH },
           fontStack,
-          { isFullscreenHero: true }
+          {
+            isFullscreenHero: true,
+            videoTimeSec: aiOutroTiming?.videoTimeSec,
+            globalTime,
+            isIdleAfterSpeech: aiOutroTiming?.isIdleAfterSpeech,
+          }
         );
       } else {
         drawPresenterHostFrame(
@@ -3843,7 +3879,11 @@ export function renderQuizFrame(
     drawBrandWatermark(ctx, template, globalTime, W, H, fontStack);
     if (aiOutroTiming && template.aiPresenter?.enabled && !aiOutroTiming.isFullscreenHero) {
       const pRect = resolveAiPresenterRect(template.aiPresenter, W, H, template.aspectRatio);
-      drawAiPresenterVideoFrame(ctx, template, template.aiPresenter, pRect, fontStack);
+      drawAiPresenterVideoFrame(ctx, template, template.aiPresenter, pRect, fontStack, {
+        videoTimeSec: aiOutroTiming.videoTimeSec,
+        globalTime,
+        isIdleAfterSpeech: aiOutroTiming.isIdleAfterSpeech,
+      });
     }
     ctx.restore();
     return;
@@ -5508,7 +5548,11 @@ export function renderQuizFrame(
   if (aiSlideTiming && template.aiPresenter?.enabled) {
     const pRect = resolveAiPresenterRect(template.aiPresenter, W, H, template.aspectRatio);
     presenterRectForHitbox = pRect;
-    drawAiPresenterVideoFrame(ctx, template, template.aiPresenter, pRect, fontStack);
+    drawAiPresenterVideoFrame(ctx, template, template.aiPresenter, pRect, fontStack, {
+      videoTimeSec: aiSlideTiming.videoTimeSec,
+      globalTime,
+      isIdleAfterSpeech: aiSlideTiming.isIdleAfterSpeech,
+    });
   } else if (template.presenterEnabled) {
     let pPhase: PresenterPhase = 'readingQuestion';
     let phaseElapsed = Math.max(0, localTime - tQuestionStart);
@@ -5532,11 +5576,22 @@ export function renderQuizFrame(
       phaseElapsed,
       slide,
       schedule,
-      localTime
+      localTime,
+      interactiveState?.demoPresenterPose
+        ? {
+            forcedPose: interactiveState.demoPresenterPose,
+            animClock: interactiveState.demoPresenterAnimClock,
+          }
+        : undefined
     );
     const pRect = resolveSlidePresenterRect(template, W, H);
     presenterRectForHitbox = pRect;
     drawPresenterHostFrame(ctx, template, choreo, pRect, fontStack);
+  }
+
+  if (template.showDynamicCaptions) {
+    const captionState = computeActiveCaptionState(slide, localTime, schedule);
+    drawDynamicCaptionsOverlay(ctx, captionState, template, W, H, fontStack);
   }
 
   // Collect exact stage hitboxes for interactive preview dragging (account for globalScale around H*0.52)

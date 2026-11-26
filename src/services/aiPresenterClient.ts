@@ -80,12 +80,14 @@ export interface GenerateAiPresenterJob {
 export interface AiPresenterVideoStatus {
   provider: 'tavus';
   videoId: string;
+  videoName?: string;
   status: 'queued' | 'generating' | 'ready' | 'error' | 'deleted' | string;
   statusDetails?: string;
   generationProgress?: string;
   downloadUrl?: string;
   streamUrl?: string;
   hostedUrl?: string;
+  createdAt?: string;
   proxiedDownloadUrl?: string;
   proxiedStreamUrl?: string;
 }
@@ -154,6 +156,15 @@ export async function submitAiPresenterGeneration(
   return parseJsonOrThrow<GenerateAiPresenterJob>(res);
 }
 
+export async function fetchAiPresenterVideosList(): Promise<AiPresenterVideoStatus[]> {
+  const res = await fetch(resolvePresenterApiUrl('/api/ai-presenter/videos'), {
+    method: 'GET',
+    cache: 'no-store',
+  });
+  const data = await parseJsonOrThrow<{ videos: AiPresenterVideoStatus[] }>(res);
+  return Array.isArray(data.videos) ? data.videos : [];
+}
+
 export async function fetchAiPresenterVideoStatus(
   videoId: string
 ): Promise<AiPresenterVideoStatus> {
@@ -171,13 +182,37 @@ export async function downloadAiPresenterMediaBlob(
   proxiedOrDirectUrl: string
 ): Promise<{ blob: Blob; mimeType: 'video/mp4' | 'video/webm' }> {
   const targetUrl = resolvePresenterApiUrl(proxiedOrDirectUrl);
-  const res = await fetch(targetUrl, { method: 'GET' });
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timeoutId = controller ? window.setTimeout(() => controller.abort(), 45_000) : 0;
+
+  let res: Response;
+  try {
+    res = await fetch(targetUrl, {
+      method: 'GET',
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+  } catch (err) {
+    if (timeoutId) window.clearTimeout(timeoutId);
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new AiPresenterApiError('انتهت مهلة تحميل ملف الفيديو. حاول مرة أخرى.', 504);
+    }
+    throw new AiPresenterApiError('تعذر الاتصال بخادم تحميل الفيديو.', 502);
+  } finally {
+    if (timeoutId) window.clearTimeout(timeoutId);
+  }
+
   if (!res.ok) {
     throw new AiPresenterApiError(`فشل تحميل ملف الفيديو المُنشأ (${res.status}).`, res.status);
   }
+
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  if (contentType.includes('text/html') || contentType.includes('application/json')) {
+    throw new AiPresenterApiError('أعاد الخادم استجابة غير صالحة بدلاً من ملف الفيديو.', 502);
+  }
+
   const rawBlob = await res.blob();
-  const contentType = (res.headers.get('content-type') || rawBlob.type || '').toLowerCase();
-  const isWebm = contentType.includes('webm') || proxiedOrDirectUrl.toLowerCase().includes('.webm');
+  const blobType = (contentType || rawBlob.type || '').toLowerCase();
+  const isWebm = blobType.includes('webm') || proxiedOrDirectUrl.toLowerCase().includes('.webm');
   const mimeType: 'video/mp4' | 'video/webm' = isWebm ? 'video/webm' : 'video/mp4';
   const typedBlob =
     rawBlob.type === mimeType ? rawBlob : new Blob([rawBlob], { type: mimeType });

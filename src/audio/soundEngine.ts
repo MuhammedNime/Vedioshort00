@@ -51,6 +51,8 @@ class SoundEngine {
   private activeSfxSources = new Set<AudioBufferSourceNode>();
   private activeVoiceSource: AudioBufferSourceNode | null = null;
   private activeVoiceGain: GainNode | null = null;
+  private activeAiVoiceSource: AudioBufferSourceNode | null = null;
+  private activeAiVoiceGain: GainNode | null = null;
   private activeBgSource: AudioBufferSourceNode | null = null;
   private activeBgGain: GainNode | null = null;
 
@@ -66,10 +68,23 @@ class SoundEngine {
   private trackSourceIfPreview(
     ctx: BaseAudioContext,
     src: AudioBufferSourceNode,
-    channel: 'sfx' | 'voice' = 'sfx',
+    channel: 'sfx' | 'voice' | 'aiPresenter' = 'sfx',
     gainNode?: GainNode
   ): void {
     if (ctx !== this.ctx) return;
+
+    if (channel === 'aiPresenter') {
+      this.stopAiPresenterAudio();
+      this.activeAiVoiceSource = src;
+      this.activeAiVoiceGain = gainNode ?? null;
+      src.onended = () => {
+        if (this.activeAiVoiceSource === src) {
+          this.activeAiVoiceSource = null;
+          this.activeAiVoiceGain = null;
+        }
+      };
+      return;
+    }
 
     if (channel === 'voice') {
       this.stopActiveVoice();
@@ -88,6 +103,26 @@ class SoundEngine {
     src.onended = () => {
       this.activeSfxSources.delete(src);
     };
+  }
+
+  public stopAiPresenterAudio(): void {
+    if (this.activeAiVoiceSource) {
+      try {
+        this.activeAiVoiceSource.stop();
+        this.activeAiVoiceSource.disconnect();
+      } catch {
+        // already stopped
+      }
+      this.activeAiVoiceSource = null;
+    }
+    if (this.activeAiVoiceGain) {
+      try {
+        this.activeAiVoiceGain.disconnect();
+      } catch {
+        // already disconnected
+      }
+      this.activeAiVoiceGain = null;
+    }
   }
 
   public stopActiveVoice(): void {
@@ -114,6 +149,7 @@ class SoundEngine {
 
   public stopAllSfxAndVoice(): void {
     this.stopActiveVoice();
+    this.stopAiPresenterAudio();
     this.activeSfxSources.forEach((src) => {
       try {
         src.stop();
@@ -241,6 +277,19 @@ class SoundEngine {
       void this.ctx.resume();
     }
     return this.ctx;
+  }
+
+  public async unlock(): Promise<AudioContext> {
+    const ctx = this.getContext();
+    if (ctx.state === 'suspended') {
+      await Promise.race([
+        ctx.resume().catch(() => undefined),
+        new Promise<void>((resolve) => {
+          window.setTimeout(resolve, 250);
+        }),
+      ]);
+    }
+    return ctx;
   }
 
   public async getAudioDuration(dataUrl: string): Promise<number> {
@@ -443,7 +492,7 @@ class SoundEngine {
     destination: AudioNode,
     startTime: number,
     maxEndTime?: number,
-    trackChannel?: 'sfx' | 'voice'
+    trackChannel?: 'sfx' | 'voice' | 'aiPresenter'
   ): void {
     const start = Math.max(ctx.currentTime, startTime);
     const naturalEnd = start + buffer.duration;
@@ -485,7 +534,7 @@ class SoundEngine {
     destination?: AudioNode,
     ctxOverride?: BaseAudioContext,
     when?: number,
-    channel: 'voice' | 'sfx' = 'voice',
+    channel: 'voice' | 'sfx' | 'aiPresenter' = 'voice',
     maxDurationSec?: number
   ): Promise<void> {
     if (volume <= 0.001 || !clip.dataUrl) return;
@@ -509,7 +558,7 @@ class SoundEngine {
     destination?: AudioNode,
     ctxOverride?: BaseAudioContext,
     when?: number,
-    channel: 'voice' | 'sfx' = 'voice'
+    channel: 'voice' | 'sfx' | 'aiPresenter' = 'voice'
   ): AudioBufferSourceNode | null {
     if (volume <= 0.001 || durationSec <= 0.03) return null;
     const ctx = ctxOverride ?? this.getContext();
@@ -1098,7 +1147,8 @@ class SoundEngine {
       }
     }
 
-    // 6.5 Real AI Human Presenter Audio Track (with exact trim & bg music ducking)
+    // 6.5 Real AI Human Presenter Audio Track (with exact trim, bg music ducking & exclusive voice priority)
+    const activeAiSpeechRanges: Array<{ start: number; end: number }> = [];
     if (template.aiPresenter?.enabled && template.aiPresenter.mediaKey && (template.aiPresenter.volume ?? 1) > 0.01) {
       const aiBuf = await decodeAiPresenterAudioBuffer(template.aiPresenter.mediaKey, offline);
       if (aiBuf) {
@@ -1114,8 +1164,9 @@ class SoundEngine {
               limiter,
               offline,
               w.timelineStart,
-              'voice'
+              'aiPresenter'
             );
+            activeAiSpeechRanges.push({ start: w.timelineStart, end: w.timelineStart + playDur });
             if (playDur > 0.2) {
               speechIntervals.push({ start: w.timelineStart, end: w.timelineStart + playDur });
             }
@@ -1124,10 +1175,21 @@ class SoundEngine {
       }
     }
 
+    const suppressSlideVoicesForAi =
+      activeAiSpeechRanges.length > 0 && template.aiPresenter?.muteOtherVoices !== false;
+
     // Enforce strictly monophonic non-overlapping Voice bus across the whole video
     voiceQueue.sort((a, b) => a.start - b.start);
     for (let i = 0; i < voiceQueue.length; i++) {
       const curr = voiceQueue[i];
+      if (
+        suppressSlideVoicesForAi &&
+        activeAiSpeechRanges.some(
+          (r) => curr.start >= r.start - 0.12 && curr.start <= r.end - 0.05
+        )
+      ) {
+        continue;
+      }
       const nextVoice = voiceQueue[i + 1];
       const hardEnd = nextVoice
         ? Math.min(curr.maxEnd, Math.max(curr.start + 0.04, nextVoice.start - 0.02))

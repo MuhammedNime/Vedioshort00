@@ -81,6 +81,7 @@ import {
   PresenterLipSyncMode,
   PresenterPhaseCommands,
   PresenterPlacement,
+  PresenterPoseId,
   PresenterSkinTone,
   PresenterStyle,
   PresetId,
@@ -184,7 +185,22 @@ export const TemplateDesignPanel: React.FC<TemplateDesignPanelProps> = ({
   const [endAudioError, setEndAudioError] = useState('');
   const [brandKits, setBrandKits] = useState<ChannelBrandKit[]>(() => loadBrandKits());
   const [brandKitNameInput, setBrandKitNameInput] = useState('');
+  const [activeDemoPose, setActiveDemoPose] = useState<PresenterPoseId | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
+  const demoPoseTimerRef = useRef<number | null>(null);
+
+  const triggerPresenterDemo = (pose: PresenterPoseId) => {
+    setActiveDemoPose(pose);
+    if (demoPoseTimerRef.current) {
+      window.clearTimeout(demoPoseTimerRef.current);
+    }
+    demoPoseTimerRef.current = window.setTimeout(() => {
+      setActiveDemoPose((prev) => (prev === pose ? null : prev));
+    }, 2600);
+    window.dispatchEvent(
+      new CustomEvent('shortvedio:presenter-demo', { detail: { pose } })
+    );
+  };
 
   type TemplateSectionId =
     | 'styles'
@@ -3637,24 +3653,55 @@ export const TemplateDesignPanel: React.FC<TemplateDesignPanelProps> = ({
                   تفعيل المذيع التفاعلي على الشاشة 🎙️
                 </div>
                 <div className="text-[11px] text-[var(--pmuted)] mt-0.5">
-                  يحرك شفتيه مع الصوت فقط، يضع يده على جبينه عند التفكير، ويظهر ملء الشاشة
+                  يحرك شفتيه تلقائياً كأنه المتحدث، ويتفاعل بـ ١٠ حركات يد وتفكير وخيارات واحتفال
                 </div>
               </div>
               <input
                 type="checkbox"
                 checked={Boolean(template.presenterEnabled)}
-                onChange={(e) => patch({ presenterEnabled: e.target.checked })}
+                onChange={(e) => {
+                  const enabled = e.target.checked;
+                  patch({
+                    presenterEnabled: enabled,
+                    ...(enabled && template.aiPresenter?.enabled
+                      ? { aiPresenter: { ...template.aiPresenter, enabled: false } }
+                      : {}),
+                  });
+                }}
                 className="w-4 h-4 accent-[#00B050] rounded cursor-pointer shrink-0"
               />
             </label>
+
+            {template.presenterEnabled && template.aiPresenter?.enabled && (
+              <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-amber-500/15 border border-amber-500/45 text-[11px]">
+                <span className="font-bold text-[var(--ptxt)]">
+                  فيديو الراوي (Tavus) نشط حالياً ويُخفي المذيع التفاعلي على المسرح.
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    patch({
+                      presenterEnabled: true,
+                      presenterStyle: 'stylized3d',
+                      aiPresenter: template.aiPresenter
+                        ? { ...template.aiPresenter, enabled: false }
+                        : undefined,
+                    })
+                  }
+                  className="shrink-0 px-2.5 py-1 rounded-lg bg-[#00B050] text-white font-extrabold cursor-pointer"
+                >
+                  إظهار التفاعلي الآن
+                </button>
+              </div>
+            )}
 
             {/* Presenter Character Selector Cards */}
             <div className="grid grid-cols-2 gap-2">
               {[
                 {
                   id: 'stylized3d' as PresenterStyle,
-                  title: 'مذيع ذكي متحرك بالكامل 🎭',
-                  sub: 'شفاه متزامنة + ذراعان ويد على الجبين',
+                  title: 'مذيع ذكي متحرك (١٠ حركات) 🎭',
+                  sub: 'شفاه متزامنة + ذراعان + تفكير + خيارات + احتفال',
                   thumb: '',
                 },
                 {
@@ -3686,7 +3733,13 @@ export const TemplateDesignPanel: React.FC<TemplateDesignPanelProps> = ({
                         presenterPhotoInputRef.current?.click();
                         return;
                       }
-                      patch({ presenterEnabled: true, presenterStyle: ch.id });
+                      patch({
+                        presenterEnabled: true,
+                        presenterStyle: ch.id,
+                        ...(template.aiPresenter?.enabled
+                          ? { aiPresenter: { ...template.aiPresenter, enabled: false } }
+                          : {}),
+                      });
                     }}
                     className={`flex items-center gap-2.5 p-2 rounded-xl border text-right transition-colors cursor-pointer ${
                       active && template.presenterEnabled
@@ -3767,6 +3820,7 @@ export const TemplateDesignPanel: React.FC<TemplateDesignPanelProps> = ({
                       }
                       className="px-2.5 py-2 rounded-lg bg-[var(--surface)] border border-[var(--pline)] text-xs text-[var(--ptxt)] focus:border-[#00B050] focus:outline-none"
                     >
+                      <option value="bottomCenter">أسفل الوسط (ثابت)</option>
                       <option value="cornerBottomLeft">أسفل اليسار (مناسب لليوتيوب)</option>
                       <option value="cornerBottomRight">أسفل اليمين</option>
                       <option value="topLeft">أعلى اليسار</option>
@@ -4242,18 +4296,95 @@ export const TemplateDesignPanel: React.FC<TemplateDesignPanelProps> = ({
                   )}
                 </div>
 
+                {/* 10 Interactive Gestures Live Showcase & Stage Director */}
+                <div className="flex flex-col gap-2.5 p-2.5 rounded-xl bg-[var(--surface)] border border-[#00B050]/40">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <span className="text-[11px] font-extrabold text-[var(--ptxt)]">
+                        الحركات الـ ١٠ التفاعلية للمذيع (اضغط للمعاينة المباشرة) 🎭
+                      </span>
+                      <div className="text-[10px] text-[var(--pmuted)]">
+                        جرّب أي حركة الآن لتظهر مباشرة مع حركة اليدين والشفاه على الشاشة
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        patch({
+                          presenterEnabled: true,
+                          presenterStyle: 'stylized3d',
+                          presenterLipSyncMode: 'audioAndReading',
+                          presenterContinuousTalk: true,
+                          presenterTalkIntensity: Math.max(75, template.presenterTalkIntensity ?? 75),
+                          presenterExpressiveness: Math.max(110, template.presenterExpressiveness ?? 110),
+                          presenterCommands: {
+                            intro: 'auto',
+                            readingQuestion: 'auto',
+                            readingOptions: 'auto',
+                            thinking: 'auto',
+                            suspense: 'auto',
+                            reveal: 'auto',
+                            outro: 'auto',
+                          },
+                          ...(template.aiPresenter?.enabled
+                            ? { aiPresenter: { ...template.aiPresenter, enabled: false } }
+                            : {}),
+                        });
+                        triggerPresenterDemo('explain');
+                      }}
+                      className="shrink-0 px-2.5 py-1.5 rounded-lg bg-[#00B050]/18 border border-[#00B050] text-[10px] font-extrabold text-[#00B050] dark:text-[#6ee7b7] cursor-pointer hover:bg-[#00B050]/25"
+                    >
+                      تفعيل التسلسل التلقائي الذكي ⚡
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {PRESENTER_GESTURE_OPTIONS.map((g, idx) => {
+                      const isDemo = activeDemoPose === g.id;
+                      return (
+                        <button
+                          key={g.id}
+                          type="button"
+                          onClick={() => {
+                            patch({
+                              presenterEnabled: true,
+                              presenterStyle: 'stylized3d',
+                              presenterLipSyncMode: 'audioAndReading',
+                              presenterContinuousTalk: true,
+                              ...(template.aiPresenter?.enabled
+                                ? { aiPresenter: { ...template.aiPresenter, enabled: false } }
+                                : {}),
+                            });
+                            triggerPresenterDemo(g.id);
+                          }}
+                          className={`flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-lg border text-right text-[10px] font-bold transition-colors cursor-pointer ${
+                            isDemo
+                              ? 'bg-[#00B050]/22 border-[#00B050] text-[#00B050] dark:text-[#6ee7b7]'
+                              : 'bg-[var(--card)] border-[var(--pline)] text-[var(--ptxt)] hover:border-[#00B050]/65'
+                          }`}
+                        >
+                          <span className="truncate">
+                            {idx + 1}. {g.shortLabel}
+                          </span>
+                          <Play className="w-3 h-3 shrink-0 opacity-75" />
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
                 {/* Stage Director: Per-phase Gesture Commands */}
                 <div className="flex flex-col gap-2 p-2.5 rounded-xl bg-[var(--surface)] border border-[var(--pline)]">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[11px] font-extrabold text-[var(--ptxt)]">
-                      أوامر حركات المذيع حسب مراحل الفيديو (Action Director)
+                      توزيع الحركات حسب مراحل الفيديو (Action Director)
                     </span>
                     <button
                       type="button"
                       onClick={() => patch({ presenterCommands: undefined })}
                       className="text-[10px] font-bold text-[#00B050] hover:underline cursor-pointer"
                     >
-                      تلقائي للكل
+                      تلقائي ذكي للكل
                     </button>
                   </div>
                   <div className="grid grid-cols-2 gap-2">
@@ -4282,17 +4413,21 @@ export const TemplateDesignPanel: React.FC<TemplateDesignPanelProps> = ({
                           </span>
                           <select
                             value={val}
-                            onChange={(e) =>
+                            onChange={(e) => {
+                              const nextCmd = e.target.value as PresenterGestureCommand;
                               patch({
                                 presenterCommands: {
                                   ...(template.presenterCommands ?? {}),
-                                  [phaseItem.key]: e.target.value as PresenterGestureCommand,
+                                  [phaseItem.key]: nextCmd,
                                 },
-                              })
-                            }
+                              });
+                              if (nextCmd !== 'auto') {
+                                triggerPresenterDemo(nextCmd);
+                              }
+                            }}
                             className="w-full px-2 py-1.5 rounded-lg bg-[var(--card)] border border-[var(--pline)] text-[11px] text-[var(--ptxt)] focus:border-[#00B050] focus:outline-none cursor-pointer"
                           >
-                            <option value="auto">تلقائي ذكي</option>
+                            <option value="auto">تلقائي ذكي (يتبدل مع الحدث)</option>
                             {PRESENTER_GESTURE_OPTIONS.map((opt) => (
                               <option key={opt.id} value={opt.id}>
                                 {opt.label}

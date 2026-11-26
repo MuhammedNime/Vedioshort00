@@ -33,7 +33,19 @@ import {
   mergeCloudQuestionsIntoBank,
   normalizeBankQuestionText,
 } from '../storage/questionBankVault';
-import { QUIZ_CATEGORIES, QuizCategory, SlideType } from '../types/quiz';
+import { QUIZ_CATEGORIES, QuizCategory, QuizProject, SlideType } from '../types/quiz';
+import {
+  idbGet,
+  listProjectsFromStore,
+  normalizeLoadedProject,
+  saveProjectToStore,
+  saveProjectsToLibraryBatch,
+} from '../storage/projectStore';
+import {
+  CustomTemplatePreset,
+  loadCustomPresetsAsync,
+  mergeCustomPresetsVault,
+} from '../storage/customPresets';
 
 const CLOUD_SYNC_META_KEY = 'shorts_quiz_cloud_sync_meta_v1';
 
@@ -790,4 +802,350 @@ export async function syncQuestionBankWithCloud(options?: {
   } finally {
     inFlightBankSyncs.delete(syncKey);
   }
+}
+
+function stripHeavyAsset(val: string | undefined): string | undefined {
+  if (!val || typeof val !== 'string') return undefined;
+  if (val.startsWith('idb-asset://')) return undefined;
+  if (val.startsWith('data:') && val.length > 24_000) return undefined;
+  return val;
+}
+
+function makeCloudSafeProjectJson(project: QuizProject): {
+  safeProject: QuizProject;
+  json: string;
+} {
+  const tpl = { ...project.template };
+  tpl.customBgDataUrl = stripHeavyAsset(tpl.customBgDataUrl);
+  tpl.brandLogoDataUrl = stripHeavyAsset(tpl.brandLogoDataUrl);
+  tpl.presenterPhotoDataUrl = stripHeavyAsset(tpl.presenterPhotoDataUrl);
+  if (tpl.introHookAudio) {
+    const safeUrl = stripHeavyAsset(tpl.introHookAudio.dataUrl);
+    tpl.introHookAudio = safeUrl ? { ...tpl.introHookAudio, dataUrl: safeUrl } : undefined;
+  }
+  if (tpl.endCardAudio) {
+    const safeUrl = stripHeavyAsset(tpl.endCardAudio.dataUrl);
+    tpl.endCardAudio = safeUrl ? { ...tpl.endCardAudio, dataUrl: safeUrl } : undefined;
+  }
+  if (tpl.aiPresenter) {
+    tpl.aiPresenter = {
+      ...tpl.aiPresenter,
+      customBgDataUrl: stripHeavyAsset(tpl.aiPresenter.customBgDataUrl),
+    };
+  }
+
+  const audioCopy = { ...project.audio };
+  for (const key of Object.keys(audioCopy) as Array<keyof typeof audioCopy>) {
+    const slot = audioCopy[key];
+    if (slot?.customDataUrl) {
+      const safeUrl = stripHeavyAsset(slot.customDataUrl);
+      audioCopy[key] = safeUrl
+        ? { ...slot, customDataUrl: safeUrl }
+        : { ...slot, customDataUrl: undefined, sourceType: 'builtin' };
+    }
+  }
+
+  const safeSlides = project.slides.slice(0, 50).map((s) => {
+    const next = { ...s };
+    next.imageDataUrl = stripHeavyAsset(next.imageDataUrl);
+    if (Array.isArray(next.optionImages)) {
+      next.optionImages = next.optionImages.map((img) => {
+        if (!img?.dataUrl) return undefined;
+        const safeUrl = stripHeavyAsset(img.dataUrl);
+        return safeUrl ? { ...img, dataUrl: safeUrl } : undefined;
+      }) as typeof next.optionImages;
+    }
+    if (next.voiceover) {
+      const vo = { ...next.voiceover };
+      if (vo.question) {
+        const safeUrl = stripHeavyAsset(vo.question.dataUrl);
+        vo.question = safeUrl ? { ...vo.question, dataUrl: safeUrl } : undefined;
+      }
+      if (Array.isArray(vo.options)) {
+        vo.options = vo.options.map((clip) => {
+          if (!clip?.dataUrl) return undefined;
+          const safeUrl = stripHeavyAsset(clip.dataUrl);
+          return safeUrl ? { ...clip, dataUrl: safeUrl } : undefined;
+        }) as typeof vo.options;
+      }
+      if (vo.answer) {
+        const safeUrl = stripHeavyAsset(vo.answer.dataUrl);
+        vo.answer = safeUrl ? { ...vo.answer, dataUrl: safeUrl } : undefined;
+      }
+      next.voiceover = vo;
+    }
+    return next;
+  });
+
+  const safeProject: QuizProject = {
+    ...project,
+    slides: safeSlides,
+    template: tpl,
+    audio: audioCopy,
+  };
+  let json = JSON.stringify(safeProject);
+  if (json.length > 640_000) {
+    // Strip all data: URIs defensively if still oversized
+    const ultraSlimSlides = safeSlides.map((s) => ({
+      ...s,
+      imageDataUrl: s.imageDataUrl?.startsWith('data:') ? undefined : s.imageDataUrl,
+      optionImages: undefined,
+      voiceover: undefined,
+    }));
+    json = JSON.stringify({
+      ...safeProject,
+      slides: ultraSlimSlides,
+      template: {
+        ...tpl,
+        customBgDataUrl: undefined,
+        brandLogoDataUrl: undefined,
+        presenterPhotoDataUrl: undefined,
+        introHookAudio: undefined,
+        endCardAudio: undefined,
+      },
+    });
+  }
+  return { safeProject, json: json.slice(0, 650_000) };
+}
+
+function mergeLocalMediaIntoCloudProject(
+  cloudProject: QuizProject,
+  localProject: QuizProject | undefined
+): QuizProject {
+  if (!localProject) return cloudProject;
+  const localSlideMap = new Map(localProject.slides.map((s) => [s.id, s]));
+  const mergedSlides = cloudProject.slides.map((cs) => {
+    const ls = localSlideMap.get(cs.id);
+    if (!ls) return cs;
+    return {
+      ...cs,
+      imageDataUrl: cs.imageDataUrl || ls.imageDataUrl,
+      optionImages: cs.optionImages ?? ls.optionImages,
+      voiceover: cs.voiceover ?? ls.voiceover,
+    };
+  });
+  return {
+    ...cloudProject,
+    slides: mergedSlides,
+    template: {
+      ...cloudProject.template,
+      customBgDataUrl: cloudProject.template.customBgDataUrl || localProject.template.customBgDataUrl,
+      brandLogoDataUrl: cloudProject.template.brandLogoDataUrl || localProject.template.brandLogoDataUrl,
+      presenterPhotoDataUrl:
+        cloudProject.template.presenterPhotoDataUrl || localProject.template.presenterPhotoDataUrl,
+      introHookAudio: cloudProject.template.introHookAudio || localProject.template.introHookAudio,
+      endCardAudio: cloudProject.template.endCardAudio || localProject.template.endCardAudio,
+    },
+  };
+}
+
+export interface SyncProjectsPresetsResult {
+  projectsPulled: number;
+  projectsPushed: number;
+  presetsPulled: number;
+  presetsPushed: number;
+  updatedActiveProject?: QuizProject;
+}
+
+export async function syncProjectsAndPresetsWithCloud(
+  currentProject: QuizProject,
+  onProgress?: (label: string) => void
+): Promise<SyncProjectsPresetsResult> {
+  const user = firebaseAuth.currentUser;
+  if (!user) {
+    throw new Error('يرجى تسجيل الدخول بحساب Google أولاً للمزامنة السحابية.');
+  }
+  await ensureFirestoreUserProfile(user);
+  await saveProjectToStore(currentProject);
+
+  // 1. Load local library projects
+  onProgress?.('جارٍ تجهيز المشاريع المحلية...');
+  const summaries = await listProjectsFromStore();
+  const localProjects = new Map<string, QuizProject>();
+  localProjects.set(currentProject.id, normalizeLoadedProject(currentProject));
+  for (const sum of summaries) {
+    if (localProjects.has(sum.id)) continue;
+    const raw = await idbGet<Partial<QuizProject>>(`project_item_${sum.id}`);
+    if (raw && Array.isArray(raw.slides) && raw.slides.length > 0) {
+      localProjects.set(sum.id, normalizeLoadedProject(raw));
+    }
+  }
+
+  // 2. Fetch cloud projects
+  onProgress?.('جارٍ مزامنة المشاريع مع السحابة...');
+  const projectsPath = `users/${user.uid}/projects`;
+  const cloudProjectsMap = new Map<string, { project: QuizProject; updatedAt: number }>();
+  try {
+    const pq = query(
+      collection(firestoreDb, 'users', user.uid, 'projects'),
+      where('ownerId', '==', user.uid)
+    );
+    const snap = await getDocs(pq);
+    for (const d of snap.docs) {
+      const data = d.data();
+      if (typeof data.projectJson !== 'string') continue;
+      try {
+        const parsed = normalizeLoadedProject(JSON.parse(data.projectJson) as Partial<QuizProject>);
+        const updatedAt = typeof data.updatedAt === 'number' ? data.updatedAt : parsed.updatedAt;
+        cloudProjectsMap.set(sanitizeFirestoreId(parsed.id), {
+          project: { ...parsed, updatedAt },
+          updatedAt,
+        });
+      } catch {
+        // skip corrupt project JSON
+      }
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, projectsPath);
+  }
+
+  let projectsPulled = 0;
+  let projectsPushed = 0;
+  const projectsToSaveLocally: QuizProject[] = [];
+  const projectsToPushCloud: QuizProject[] = [];
+
+  for (const [safeId, cloudEntry] of cloudProjectsMap.entries()) {
+    const localMatch = Array.from(localProjects.values()).find(
+      (p) => sanitizeFirestoreId(p.id) === safeId
+    );
+    if (!localMatch || cloudEntry.updatedAt > (localMatch.updatedAt || 0) + 1500) {
+      const merged = mergeLocalMediaIntoCloudProject(cloudEntry.project, localMatch);
+      projectsToSaveLocally.push(merged);
+      projectsPulled += 1;
+    }
+  }
+
+  for (const localProj of localProjects.values()) {
+    const safeId = sanitizeFirestoreId(localProj.id);
+    const cloudMatch = cloudProjectsMap.get(safeId);
+    if (!cloudMatch || (localProj.updatedAt || 0) > cloudMatch.updatedAt + 1500) {
+      projectsToPushCloud.push(localProj);
+    }
+  }
+
+  if (projectsToSaveLocally.length > 0) {
+    await saveProjectsToLibraryBatch(projectsToSaveLocally);
+  }
+
+  if (projectsToPushCloud.length > 0) {
+    for (const proj of projectsToPushCloud) {
+      const safeId = sanitizeFirestoreId(proj.id);
+      const { safeProject, json } = makeCloudSafeProjectJson(proj);
+      const pRef = doc(firestoreDb, 'users', user.uid, 'projects', safeId);
+      const docPath = `users/${user.uid}/projects/${safeId}`;
+      try {
+        await setDoc(pRef, {
+          id: safeId,
+          ownerId: user.uid,
+          name: (safeProject.name || 'مشروع بدون اسم').slice(0, 120),
+          schemaVersion: Math.max(1, Math.min(30, Math.round(safeProject.schemaVersion || 9))),
+          preferredAiVoice: safeProject.preferredAiVoice || 'Kore',
+          aspectRatio: safeProject.template.aspectRatio === '16:9' ? '16:9' : '9:16',
+          slideCount: Math.max(1, Math.min(50, safeProject.slides.length)),
+          projectJson: json,
+          updatedAt: Math.max(0, Math.floor(safeProject.updatedAt || Date.now())),
+          serverUpdatedAt: serverTimestamp(),
+        });
+        projectsPushed += 1;
+      } catch (error) {
+        handleFirestoreError(error, OperationType.WRITE, docPath);
+      }
+    }
+  }
+
+  // 3. Sync Custom Style Presets
+  onProgress?.('جارٍ مزامنة الستايلات المحفوظة...');
+  const presetsPath = `users/${user.uid}/presets`;
+  const localPresets = await loadCustomPresetsAsync();
+  const cloudPresetsList: CustomTemplatePreset[] = [];
+  const cloudPresetUpdated = new Map<string, number>();
+
+  try {
+    const prQ = query(
+      collection(firestoreDb, 'users', user.uid, 'presets'),
+      where('ownerId', '==', user.uid)
+    );
+    const snap = await getDocs(prQ);
+    for (const d of snap.docs) {
+      const data = d.data();
+      if (typeof data.presetJson !== 'string') continue;
+      try {
+        const parsed = JSON.parse(data.presetJson) as CustomTemplatePreset;
+        if (parsed && parsed.id && parsed.template) {
+          cloudPresetsList.push(parsed);
+          cloudPresetUpdated.set(
+            sanitizeFirestoreId(parsed.id),
+            typeof data.updatedAt === 'number' ? data.updatedAt : parsed.updatedAt || parsed.createdAt
+          );
+        }
+      } catch {
+        // skip invalid preset
+      }
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, presetsPath);
+  }
+
+  const localPresetIds = new Set(localPresets.map((p) => sanitizeFirestoreId(p.id)));
+  const presetsPulled = cloudPresetsList.filter(
+    (cp) => !localPresetIds.has(sanitizeFirestoreId(cp.id))
+  ).length;
+  if (cloudPresetsList.length > 0) {
+    await mergeCustomPresetsVault(cloudPresetsList);
+  }
+
+  let presetsPushed = 0;
+  for (const preset of localPresets) {
+    const safeId = sanitizeFirestoreId(preset.id);
+    const cloudTs = cloudPresetUpdated.get(safeId) ?? -1;
+    const localTs = preset.updatedAt || preset.createdAt || 0;
+    if (cloudTs < 0 || localTs > cloudTs + 1500) {
+      const slimTpl = { ...preset.template };
+      slimTpl.customBgDataUrl = stripHeavyAsset(slimTpl.customBgDataUrl);
+      slimTpl.brandLogoDataUrl = stripHeavyAsset(slimTpl.brandLogoDataUrl);
+      slimTpl.presenterPhotoDataUrl = stripHeavyAsset(slimTpl.presenterPhotoDataUrl);
+      const slimPreset: CustomTemplatePreset = { ...preset, template: slimTpl };
+      const json = JSON.stringify(slimPreset).slice(0, 149_000);
+      const prRef = doc(firestoreDb, 'users', user.uid, 'presets', safeId);
+      try {
+        await setDoc(prRef, {
+          id: safeId,
+          ownerId: user.uid,
+          name: (preset.name || 'ستايلي الخاص').slice(0, 120),
+          createdAt: Math.max(0, Math.floor(preset.createdAt || Date.now())),
+          updatedAt: Math.max(0, Math.floor(localTs || Date.now())),
+          includesMedia: Boolean(preset.includesMedia),
+          presetJson: json,
+          serverUpdatedAt: serverTimestamp(),
+        });
+        presetsPushed += 1;
+      } catch (error) {
+        handleFirestoreError(error, OperationType.WRITE, `users/${user.uid}/presets/${safeId}`);
+      }
+    }
+  }
+
+  const updatedActiveProject = projectsToSaveLocally.find((p) => p.id === currentProject.id);
+
+  return {
+    projectsPulled,
+    projectsPushed,
+    presetsPulled,
+    presetsPushed,
+    updatedActiveProject,
+  };
+}
+
+export interface FullWorkspaceSyncResult {
+  bank: SyncQuestionBankResult;
+  workspace: SyncProjectsPresetsResult;
+}
+
+export async function syncFullWorkspaceWithCloud(
+  currentProject: QuizProject,
+  onProgress?: (label: string) => void
+): Promise<FullWorkspaceSyncResult> {
+  const bank = await syncQuestionBankWithCloud({ onProgress });
+  const workspace = await syncProjectsAndPresetsWithCloud(currentProject, onProgress);
+  return { bank, workspace };
 }

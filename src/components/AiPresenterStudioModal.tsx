@@ -18,11 +18,13 @@ import { registerAiPresenterBlob } from '../canvas/aiPresenterMedia';
 import {
   AiPresenterBackgroundSettingsPayload,
   AiPresenterStatusResponse,
+  AiPresenterVideoStatus,
   GenerateAiPresenterRequest,
   TavusReplicaItem,
   downloadAiPresenterMediaBlob,
   fetchAiPresenterStatus,
   fetchAiPresenterVideoStatus,
+  fetchAiPresenterVideosList,
   fetchTavusReplicas,
   resolvePresenterApiUrl,
   submitAiPresenterGeneration,
@@ -182,6 +184,7 @@ interface AiPresenterStudioModalProps {
   slides: QuestionSlide[];
   activeSlideIndex: number;
   onUpdateTemplate: (next: TemplateSettings, immediate?: boolean) => void;
+  onConnectionChecked?: (configured: boolean) => void;
 }
 
 type StudioInnerTab = 'create' | 'manage';
@@ -194,6 +197,7 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
   slides,
   activeSlideIndex,
   onUpdateTemplate,
+  onConnectionChecked,
 }) => {
   const existingAi = template.aiPresenter;
   const [innerTab, setInnerTab] = useState<StudioInnerTab>(existingAi ? 'create' : 'create');
@@ -242,11 +246,178 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
     customBgDataUrl?: string;
   } | null>(null);
 
-  const [insertScope, setInsertScope] = useState<AiPresenterScope>('intro');
+  const [insertScope, setInsertScope] = useState<AiPresenterScope>('fullTimeline');
+  const [afterSpeechBehavior, setAfterSpeechBehavior] = useState<'stayIdle' | 'loop' | 'hide'>('stayIdle');
+  const [startPhase, setStartPhase] = useState<'timelineStart' | 'firstQuestion'>('timelineStart');
+  const [tavusVideos, setTavusVideos] = useState<AiPresenterVideoStatus[]>([]);
+  const [isLoadingTavusVideos, setIsLoadingTavusVideos] = useState(false);
+  const [importingVideoId, setImportingVideoId] = useState<string | null>(null);
 
   const cancelPollRef = useRef(false);
   const customBgFileRef = useRef<HTMLInputElement | null>(null);
   const localAudioFileRef = useRef<HTMLInputElement | null>(null);
+  const PENDING_JOB_STORAGE_KEY = 'ai_presenter_pending_job_v1';
+
+  const loadReadyVideoIntoPreview = async (
+    st: AiPresenterVideoStatus,
+    overrideMeta?: {
+      replicaId?: string;
+      replicaName?: string;
+      script?: string;
+      voiceSource?: VoiceMode;
+      transparentRequested?: boolean;
+      fastRequested?: boolean;
+      bgMode?: AiPresenterBgMode;
+      bgColor?: string;
+      customBgDataUrl?: string;
+    }
+  ) => {
+    const fallbackDur = Math.max(2, Math.round(scriptText.trim().split(/\s+/).filter(Boolean).length / 2.2) || 6);
+    const primaryEndpoint =
+      st.proxiedDownloadUrl ||
+      st.proxiedStreamUrl ||
+      st.downloadUrl ||
+      st.streamUrl;
+
+    if (!primaryEndpoint) {
+      throw new Error('اكتمل التوليد لكن لم يصل رابط تنزيل الفيديو.');
+    }
+
+    setGenProgressPct(95);
+    setGenStatusText('جارٍ تحميل الفيديو وتجهيزه داخل الاستوديو...');
+
+    let downloaded: { blob: Blob; mimeType: 'video/mp4' | 'video/webm' };
+    try {
+      downloaded = await downloadAiPresenterMediaBlob(primaryEndpoint);
+    } catch (primaryErr) {
+      const altEndpoint = st.proxiedStreamUrl && st.proxiedStreamUrl !== primaryEndpoint ? st.proxiedStreamUrl : '';
+      if (!altEndpoint) throw primaryErr;
+      downloaded = await downloadAiPresenterMediaBlob(altEndpoint);
+    }
+    const { blob, mimeType } = downloaded;
+    const previewUrl = URL.createObjectURL(blob);
+
+    const duration = await new Promise<number>((resolve) => {
+      const v = document.createElement('video');
+      v.preload = 'metadata';
+      v.onloadedmetadata = () => {
+        resolve(Number.isFinite(v.duration) && v.duration > 0 ? v.duration : fallbackDur);
+      };
+      v.onerror = () => resolve(fallbackDur);
+      v.src = previewUrl;
+    });
+
+    if (generatedMedia?.previewUrl) {
+      try {
+        URL.revokeObjectURL(generatedMedia.previewUrl);
+      } catch {
+        // ignore
+      }
+    }
+
+    const wasTransparent =
+      overrideMeta?.transparentRequested ??
+      (mimeType === 'video/webm' ? true : Boolean(previewBgPayload.transparent_background));
+
+    setGeneratedMedia({
+      videoId: st.videoId,
+      replicaId: overrideMeta?.replicaId ?? selectedReplicaId,
+      replicaName:
+        overrideMeta?.replicaName ??
+        selectedReplica?.replicaName ??
+        st.videoName ??
+        'الراوي الذكي',
+      script: overrideMeta?.script ?? scriptText.trim(),
+      voiceSource: overrideMeta?.voiceSource ?? voiceMode,
+      blob,
+      mimeType,
+      previewUrl,
+      duration,
+      transparentRequested: wasTransparent,
+      fastRequested: overrideMeta?.fastRequested ?? fastRender,
+      bgMode: overrideMeta?.bgMode ?? (mimeType === 'video/webm' ? bgMode : 'original'),
+      bgColor: overrideMeta?.bgColor ?? (bgMode === 'white' ? '#FFFFFF' : bgColor),
+      customBgDataUrl: overrideMeta?.customBgDataUrl ?? customBgDataUrl,
+    });
+
+    setGenProgressPct(100);
+    setGenStatusText('اكتمل فيديو الراوي البشري الحقيقي! اضغط «إدراج في الفيديو» بالأسفل.');
+  };
+
+  const pollVideoUntilReady = async (
+    videoId: string,
+    overrideMeta?: Parameters<typeof loadReadyVideoIntoPreview>[1]
+  ) => {
+    setIsGenerating(true);
+    setGenError('');
+    const maxPolls = 90;
+    let completedStatus: AiPresenterVideoStatus | null = null;
+
+    try {
+      for (let attempt = 0; attempt < maxPolls; attempt++) {
+        if (cancelPollRef.current) return;
+        const st = await fetchAiPresenterVideoStatus(videoId);
+        const progMatch = (st.generationProgress || '').match(/(\d+)\s*\/\s*100/);
+        const pct = progMatch
+          ? Math.min(92, Math.max(18, parseInt(progMatch[1], 10)))
+          : Math.min(88, 18 + attempt * 3);
+        setGenProgressPct(pct);
+
+        if (st.status === 'ready') {
+          completedStatus = st;
+          break;
+        }
+        if (st.status === 'error' || st.status === 'deleted') {
+          try {
+            localStorage.removeItem(PENDING_JOB_STORAGE_KEY);
+          } catch {
+            // ignore
+          }
+          throw new Error(st.statusDetails || 'فشل توليد الفيديو في خادم Tavus.');
+        }
+
+        setGenStatusText(
+          st.generationProgress
+            ? `جارٍ التوليد الواقعي ومزامنة الشفاه (${st.generationProgress})...`
+            : `الحالة: ${st.status} — جارٍ المعالجة...`
+        );
+
+        await new Promise((r) => window.setTimeout(r, 3000));
+      }
+
+      if (cancelPollRef.current) return;
+
+      if (!completedStatus) {
+        throw new Error('استغرق التوليد وقتاً أطول من المتوقع. سيظهر الفيديو في سجل Tavus فور اكتماله.');
+      }
+
+      try {
+        localStorage.removeItem(PENDING_JOB_STORAGE_KEY);
+      } catch {
+        // ignore
+      }
+
+      await loadReadyVideoIntoPreview(completedStatus, overrideMeta);
+    } catch (err) {
+      setGenError(err instanceof Error ? err.message : 'تعذر متابعة/تحميل فيديو الراوي.');
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  const loadTavusVideosList = async () => {
+    setIsLoadingTavusVideos(true);
+    try {
+      const vids = await fetchAiPresenterVideosList();
+      setTavusVideos(vids);
+    } catch (err) {
+      setReplicaError(
+        err instanceof Error ? err.message : 'تعذر تحديث قائمة الفيديوهات من Tavus.'
+      );
+    } finally {
+      setIsLoadingTavusVideos(false);
+    }
+  };
 
   const loadStatusAndReplicas = async () => {
     setIsLoadingStatus(true);
@@ -254,13 +425,45 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
     try {
       const st = await fetchAiPresenterStatus();
       setStatusInfo(st);
+      onConnectionChecked?.(st.configured);
       if (st.configured) {
         setIsLoadingReplicas(true);
         try {
-          const list = await fetchTavusReplicas();
+          const [list, vids] = await Promise.all([
+            fetchTavusReplicas(),
+            fetchAiPresenterVideosList().catch(() => [] as AiPresenterVideoStatus[]),
+          ]);
           setReplicas(list);
+          setTavusVideos(vids);
           if (list.length > 0 && !selectedReplicaId) {
             setSelectedReplicaId(list[0].replicaId);
+          }
+
+          // Resume tracking if user previously closed the modal mid-generation
+          let savedPendingId = '';
+          try {
+            savedPendingId = localStorage.getItem(PENDING_JOB_STORAGE_KEY) || '';
+          } catch {
+            savedPendingId = '';
+          }
+          if (savedPendingId && !isGenerating && !generatedMedia) {
+            const matchVid = vids.find((v) => v.videoId === savedPendingId);
+            if (matchVid?.status === 'ready') {
+              try {
+                localStorage.removeItem(PENDING_JOB_STORAGE_KEY);
+              } catch {
+                // ignore
+              }
+              await loadReadyVideoIntoPreview(matchVid);
+            } else if (
+              !matchVid ||
+              matchVid.status === 'queued' ||
+              matchVid.status === 'generating'
+            ) {
+              setGenProgressPct(20);
+              setGenStatusText(`استكمال متابعة طلبك السابق (${savedPendingId})...`);
+              void pollVideoUntilReady(savedPendingId);
+            }
           }
         } catch (err) {
           setReplicaError(
@@ -271,6 +474,7 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
         }
       } else {
         setReplicas([]);
+        setTavusVideos([]);
       }
     } catch (err) {
       setReplicaError(
@@ -291,8 +495,9 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
     if (!scriptText.trim()) {
       const activeQ = slides[activeSlideIndex]?.question?.trim();
       const hookT = template.introHookText?.trim();
+      const combined = [hookT, activeQ].filter(Boolean).join(' — ');
       setScriptText(
-        hookT || activeQ || 'أهلاً بكم في تحدي المعلومات! هل تستطيع حل هذا السؤال قبل انتهاء الوقت؟'
+        combined || 'أهلاً بكم في تحدي المعلومات! هل تستطيع حل هذا السؤال قبل انتهاء الوقت؟'
       );
     }
     return () => {
@@ -439,106 +644,136 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
             ? { audio_url: audioUrlInput.trim() }
             : { audio_data_url: localAudioDataUrl }),
         video_name: `ShortVedio0_${Date.now()}`,
-        fast: fastRender,
+        fast: bgPayload.transparent_background ? true : fastRender,
         ...bgPayload,
       };
 
       const job = await submitAiPresenterGeneration(requestJson);
+      try {
+        localStorage.setItem(PENDING_JOB_STORAGE_KEY, job.videoId);
+      } catch {
+        // ignore
+      }
 
       setGenProgressPct(15);
       setGenStatusText(`تم قبول الطلب (${job.videoId}) — جارٍ المعالجة في Tavus...`);
 
-      const maxPolls = 90; // up to ~4.5 minutes
-      let completedStatus = null;
-      for (let attempt = 0; attempt < maxPolls; attempt++) {
-        if (cancelPollRef.current) return;
-        await new Promise((r) => window.setTimeout(r, 3000));
-        if (cancelPollRef.current) return;
-
-        const st = await fetchAiPresenterVideoStatus(job.videoId);
-        const progMatch = (st.generationProgress || '').match(/(\d+)\s*\/\s*100/);
-        const pct = progMatch ? Math.min(92, Math.max(18, parseInt(progMatch[1], 10))) : Math.min(88, 18 + attempt * 3);
-        setGenProgressPct(pct);
-
-        if (st.status === 'ready') {
-          completedStatus = st;
-          break;
-        }
-        if (st.status === 'error' || st.status === 'deleted') {
-          throw new Error(st.statusDetails || 'فشل توليد الفيديو في خادم Tavus.');
-        }
-
-        setGenStatusText(
-          st.generationProgress
-            ? `جارٍ التوليد الواقعي ومزامنة الشفاه (${st.generationProgress})...`
-            : `الحالة: ${st.status} — جارٍ المعالجة...`
-        );
-      }
-
-      if (!completedStatus) {
-        throw new Error('استغرق التوليد وقتاً أطول من المتوقع. تحقق من لوحة Tavus أو أعد المحاولة بنص أقصر.');
-      }
-
-      const mediaEndpoint =
-        completedStatus.proxiedDownloadUrl ||
-        completedStatus.proxiedStreamUrl ||
-        completedStatus.downloadUrl ||
-        completedStatus.streamUrl;
-
-      if (!mediaEndpoint) {
-        throw new Error('اكتمل التوليد لكن لم يصل رابط تنزيل الفيديو.');
-      }
-
-      setGenProgressPct(95);
-      setGenStatusText('جارٍ تحميل الفيديو وتجهيزه داخل الاستوديو...');
-
-      const { blob, mimeType } = await downloadAiPresenterMediaBlob(mediaEndpoint);
-      const previewUrl = URL.createObjectURL(blob);
-
-      // Probe true video duration
-      const duration = await new Promise<number>((resolve) => {
-        const v = document.createElement('video');
-        v.preload = 'metadata';
-        v.onloadedmetadata = () => {
-          resolve(Number.isFinite(v.duration) && v.duration > 0 ? v.duration : estSeconds);
-        };
-        v.onerror = () => resolve(estSeconds);
-        v.src = previewUrl;
-      });
-
-      if (generatedMedia?.previewUrl) {
-        try {
-          URL.revokeObjectURL(generatedMedia.previewUrl);
-        } catch {
-          // ignore
-        }
-      }
-
-      const wasTransparentRequested = Boolean(previewBgPayload.transparent_background);
-
-      setGeneratedMedia({
-        videoId: completedStatus.videoId,
+      await new Promise((r) => window.setTimeout(r, 2500));
+      await pollVideoUntilReady(job.videoId, {
         replicaId: selectedReplicaId,
         replicaName: selectedReplica?.replicaName || 'الراوي الذكي',
         script: scriptText.trim(),
         voiceSource: voiceMode,
-        blob,
-        mimeType,
-        previewUrl,
-        duration,
-        transparentRequested: wasTransparentRequested,
-        fastRequested: fastRender,
+        transparentRequested: Boolean(bgPayload.transparent_background),
+        fastRequested: Boolean(requestJson.fast),
         bgMode,
         bgColor: bgMode === 'white' ? '#FFFFFF' : bgColor,
         customBgDataUrl,
       });
-
-      setGenProgressPct(100);
-      setGenStatusText('اكتمل فيديو الراوي البشري الحقيقي بنجاح!');
+      void loadTavusVideosList();
     } catch (err) {
       setGenError(err instanceof Error ? err.message : 'تعذر إنشاء فيديو الراوي.');
-    } finally {
       setIsGenerating(false);
+    }
+  };
+
+  const handleImportExistingTavusVideo = async (vid: AiPresenterVideoStatus) => {
+    if (importingVideoId) return;
+    setImportingVideoId(vid.videoId);
+    setGenError('');
+    try {
+      const primaryEndpoint =
+        vid.proxiedDownloadUrl || vid.proxiedStreamUrl || vid.downloadUrl || vid.streamUrl;
+      if (!primaryEndpoint) {
+        throw new Error('رابط هذا الفيديو غير متاح حالياً.');
+      }
+      let downloaded: { blob: Blob; mimeType: 'video/mp4' | 'video/webm' };
+      try {
+        downloaded = await downloadAiPresenterMediaBlob(primaryEndpoint);
+      } catch (primaryErr) {
+        const altEndpoint = vid.proxiedStreamUrl && vid.proxiedStreamUrl !== primaryEndpoint ? vid.proxiedStreamUrl : '';
+        if (!altEndpoint) throw primaryErr;
+        downloaded = await downloadAiPresenterMediaBlob(altEndpoint);
+      }
+      const { blob, mimeType } = downloaded;
+      const previewUrl = URL.createObjectURL(blob);
+      const duration = await new Promise<number>((resolve) => {
+        const v = document.createElement('video');
+        v.preload = 'metadata';
+        v.onloadedmetadata = () => {
+          resolve(Number.isFinite(v.duration) && v.duration > 0 ? v.duration : 6);
+        };
+        v.onerror = () => resolve(6);
+        v.src = previewUrl;
+      });
+
+      const mediaKey = `ai_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      await registerAiPresenterBlob(mediaKey, blob, mimeType, true);
+
+      const isAlpha = mimeType === 'video/webm';
+      const newOverlay: AiPresenterOverlay = {
+        enabled: true,
+        provider: 'tavus',
+        videoId: vid.videoId,
+        replicaId: selectedReplicaId || 'tavus',
+        replicaName: vid.videoName || 'الراوي الذكي',
+        script: '',
+        voiceSource: 'script',
+        transparentRequested: isAlpha,
+        fastRequested: true,
+        mimeType,
+        naturalDuration: duration,
+        mediaKey,
+        scope: insertScope,
+        targetSlideIndex: activeSlideIndex,
+        placement: 'bottomCenter',
+        x: 50,
+        y: 82,
+        scale: 95,
+        frameShape: isAlpha ? 'cutout' : 'broadcastCard',
+        bgMode: isAlpha ? 'transparent' : 'original',
+        bgColor: '#FFFFFF',
+        trimStart: 0,
+        trimEnd: duration,
+        startOffset: 0,
+        displayDuration: 0,
+        volume: 1,
+        muteOtherVoices: true,
+        showNameBadge: false,
+        fullscreenInIntro: false,
+        fullscreenInOutro: false,
+        afterSpeechBehavior:
+          insertScope === 'fullTimeline' || insertScope === 'allSlides'
+            ? afterSpeechBehavior
+            : 'hide',
+        startPhase,
+      };
+
+      const nextTemplate: TemplateSettings = {
+        ...template,
+        aiPresenter: newOverlay,
+        ...(insertScope === 'intro'
+          ? {
+              showIntroHook: true,
+              introHookDuration: Math.max(
+                template.introHookDuration ?? 1.2,
+                Math.min(30, Math.ceil(duration * 10) / 10)
+              ),
+            }
+          : {}),
+        ...(insertScope === 'outro' && !template.showEndCard ? { showEndCard: true } : {}),
+      };
+      onUpdateTemplate(nextTemplate, true);
+      try {
+        URL.revokeObjectURL(previewUrl);
+      } catch {
+        // ignore
+      }
+      onClose();
+    } catch (err) {
+      setGenError(err instanceof Error ? err.message : 'تعذر تحميل وإدراج الفيديو.');
+    } finally {
+      setImportingVideoId(null);
     }
   };
 
@@ -571,15 +806,10 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
       mediaKey,
       scope: replaceExisting && existingAi ? existingAi.scope : insertScope,
       targetSlideIndex: activeSlideIndex,
-      placement:
-        replaceExisting && existingAi
-          ? existingAi.placement
-          : insertScope === 'intro' || insertScope === 'outro'
-            ? 'cornerBottomRight'
-            : 'cornerBottomRight',
-      x: replaceExisting && existingAi ? existingAi.x : 82,
-      y: replaceExisting && existingAi ? existingAi.y : 78,
-      scale: replaceExisting && existingAi ? existingAi.scale : 100,
+      placement: replaceExisting && existingAi ? existingAi.placement : 'bottomCenter',
+      x: replaceExisting && existingAi ? existingAi.x : 50,
+      y: replaceExisting && existingAi ? existingAi.y : 82,
+      scale: replaceExisting && existingAi ? existingAi.scale : 95,
       frameShape:
         replaceExisting && existingAi
           ? existingAi.frameShape
@@ -594,28 +824,39 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
       startOffset: 0,
       displayDuration: 0,
       volume: 1,
+      muteOtherVoices: replaceExisting && existingAi ? (existingAi.muteOtherVoices ?? true) : true,
       showNameBadge: false,
-      fullscreenInIntro: true,
-      fullscreenInOutro: true,
+      fullscreenInIntro: replaceExisting && existingAi ? Boolean(existingAi.fullscreenInIntro) : false,
+      fullscreenInOutro: replaceExisting && existingAi ? Boolean(existingAi.fullscreenInOutro) : false,
+      afterSpeechBehavior:
+        replaceExisting && existingAi?.afterSpeechBehavior
+          ? existingAi.afterSpeechBehavior
+          : insertScope === 'fullTimeline' || insertScope === 'allSlides'
+            ? afterSpeechBehavior
+            : 'hide',
+      startPhase:
+        replaceExisting && existingAi?.startPhase ? existingAi.startPhase : startPhase,
     };
 
+    const effectiveScope = newOverlay.scope;
     const nextTemplate: TemplateSettings = {
       ...template,
       aiPresenter: newOverlay,
-      ...(insertScope === 'intro' && !template.showIntroHook
+      ...(effectiveScope === 'intro'
         ? {
             showIntroHook: true,
             introHookDuration: Math.max(
               template.introHookDuration ?? 1.2,
-              Math.min(8, Math.ceil(generatedMedia.duration * 10) / 10)
+              Math.min(30, Math.ceil(generatedMedia.duration * 10) / 10)
             ),
           }
         : {}),
-      ...(insertScope === 'outro' && !template.showEndCard ? { showEndCard: true } : {}),
+      ...(effectiveScope === 'outro' && !template.showEndCard ? { showEndCard: true } : {}),
     };
 
     onUpdateTemplate(nextTemplate, true);
     setInnerTab('manage');
+    onClose();
   };
 
   return (
@@ -744,9 +985,10 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
                 </div>
 
                 {statusInfo?.configured ? (
-                  <p className="mt-1.5 text-[11px] text-[var(--pmuted)] leading-relaxed">
-                    الخطة المجانية: <strong>~5 دقائق شهرياً</strong> لتوليد فيديوهات بشرية واقعية تتجدد
-                    تلقائياً كل شهر <strong>بدون بطاقة بنكية وبدون خصم تلقائي</strong>.
+                  <p className="mt-1.5 text-[11px] text-[var(--ptxt)]/85 leading-relaxed">
+                    <strong>تم تفعيل مفتاح Tavus بنجاح!</strong> اختر شخصية بشرية أدناه، اكتب النص العربي، ثم اضغط{' '}
+                    <strong>«إنشاء الراوي»</strong> وبعدها <strong>«إدراج في الفيديو»</strong> ليظهر الراوي الحقيقي داخل مشروعك.{' '}
+                    <span className="text-[var(--pmuted)]">(الرصيد المجاني: ~5 دقائق شهرياً تتجدد تلقائياً بدون بطاقة).</span>
                   </p>
                 ) : (
                   <div className="mt-2 text-[11px] text-amber-200/90 leading-relaxed space-y-1">
@@ -766,6 +1008,79 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
                   </div>
                 )}
               </div>
+
+              {/* Existing Generated Videos on Tavus Account (Recovery & Instant Insert) */}
+              {statusInfo?.configured && tavusVideos.length > 0 && (
+                <div className="flex flex-col gap-2 p-3 rounded-xl bg-[var(--surface)] border border-[#00B050]/45">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-extrabold text-[var(--ptxt)]">
+                      فيديوهاتك المُرسلة على Tavus ({tavusVideos.length})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void loadTavusVideosList()}
+                      disabled={isLoadingTavusVideos}
+                      className="flex items-center gap-1 px-2 py-1 rounded-md bg-[var(--panel)] border border-[var(--pline)] text-[10px] font-bold text-[var(--ptxt)] cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${isLoadingTavusVideos ? 'animate-spin' : ''}`} />
+                      <span>تحديث السجل</span>
+                    </button>
+                  </div>
+                  <div className="flex flex-col gap-1.5 max-h-40 overflow-y-auto">
+                    {tavusVideos.slice(0, 6).map((vid) => {
+                      const isReady = vid.status === 'ready';
+                      const isBusy = importingVideoId === vid.videoId;
+                      return (
+                        <div
+                          key={vid.videoId}
+                          className="flex items-center justify-between gap-2 p-2 rounded-lg bg-[var(--panel)] border border-[var(--pline)]"
+                        >
+                          <div className="min-w-0">
+                            <div className="text-[11px] font-bold text-[var(--ptxt)] truncate">
+                              {vid.videoName || vid.videoId}
+                            </div>
+                            <div className="text-[10px] text-[var(--pmuted)]">
+                              {isReady
+                                ? 'جاهز للإدراج فوراً ✓'
+                                : vid.status === 'error'
+                                  ? `فشل: ${vid.statusDetails || 'خطأ'}`
+                                  : `قيد المعالجة (${vid.generationProgress || vid.status})`}
+                            </div>
+                          </div>
+                          {isReady ? (
+                            <button
+                              type="button"
+                              disabled={Boolean(importingVideoId)}
+                              onClick={() => void handleImportExistingTavusVideo(vid)}
+                              className="shrink-0 flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#00B050] hover:bg-[#00c85b] disabled:opacity-50 text-white text-[10px] font-extrabold cursor-pointer"
+                            >
+                              {isBusy ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <Film className="w-3 h-3" />
+                              )}
+                              <span>{isBusy ? 'جارٍ الإدراج...' : 'إدراج بالاستوديو'}</span>
+                            </button>
+                          ) : (vid.status === 'queued' || vid.status === 'generating') ? (
+                            <button
+                              type="button"
+                              disabled={isGenerating}
+                              onClick={() => {
+                                setGenProgressPct(25);
+                                setGenStatusText(`متابعة التوليد (${vid.videoId})...`);
+                                void pollVideoUntilReady(vid.videoId);
+                              }}
+                              className="shrink-0 px-2.5 py-1 rounded-lg bg-amber-500/15 border border-amber-500/40 text-amber-300 text-[10px] font-bold cursor-pointer"
+                            >
+                              متابعة
+                            </button>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               {/* Step 1: Real Human Replicas */}
               <div className="flex flex-col gap-2">
@@ -864,7 +1179,19 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
               <div className="flex flex-col gap-2">
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs font-extrabold text-[var(--ptxt)]">2. الصوت والنص</span>
-                  <div className="flex items-center gap-1">
+                  <div className="flex items-center gap-1 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const intro =
+                          template.introHookText?.trim() || 'أهلاً بكم في تحدي المعلومات!';
+                        const q = slides[activeSlideIndex]?.question?.trim() || '';
+                        setScriptText(q ? `${intro} ${q}` : intro);
+                      }}
+                      className="px-2 py-0.5 rounded bg-[#00B050]/12 border border-[#00B050]/35 text-[10px] font-bold text-[#00B050] dark:text-[#6ee7b7] cursor-pointer"
+                    >
+                      مقدمة + السؤال
+                    </button>
                     <button
                       type="button"
                       onClick={() =>
@@ -884,6 +1211,21 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
                       className="px-2 py-0.5 rounded bg-[var(--surface)] border border-[var(--pline)] text-[10px] font-bold text-[var(--pmuted)] hover:text-[var(--ptxt)] cursor-pointer"
                     >
                       السؤال الحالي
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const intro =
+                          template.introHookText?.trim() || 'أهلاً بكم في تحدي المعلومات!';
+                        const qs = slides
+                          .map((s, i) => (s.question?.trim() ? `السؤال ${i + 1}: ${s.question.trim()}` : ''))
+                          .filter(Boolean)
+                          .join(' ... ');
+                        setScriptText(qs ? `${intro} ${qs}` : intro);
+                      }}
+                      className="px-2 py-0.5 rounded bg-[var(--surface)] border border-[var(--pline)] text-[10px] font-bold text-[var(--pmuted)] hover:text-[var(--ptxt)] cursor-pointer"
+                    >
+                      كل الأسئلة ({slides.length})
                     </button>
                     <button
                       type="button"
@@ -1197,14 +1539,22 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
                 </div>
 
                 <label className="flex items-center justify-between gap-2 cursor-pointer text-xs">
-                  <span className="font-semibold text-[var(--ptxt)]">
-                    تفعيل التوليد السريع (Fast Render)
-                  </span>
+                  <div className="min-w-0">
+                    <span className="font-semibold text-[var(--ptxt)] block">
+                      تفعيل التوليد السريع (Fast Render)
+                    </span>
+                    {previewBgPayload.transparent_background && (
+                      <span className="text-[10px] text-[var(--pmuted)] block">
+                        مفعّل تلقائياً لأن الخلفية الشفافة في Tavus تتطلب المعالجة السريعة.
+                      </span>
+                    )}
+                  </div>
                   <input
                     type="checkbox"
-                    checked={fastRender}
+                    checked={previewBgPayload.transparent_background ? true : fastRender}
+                    disabled={previewBgPayload.transparent_background}
                     onChange={(e) => setFastRender(e.target.checked)}
-                    className="w-4 h-4 accent-[#00B050] rounded cursor-pointer"
+                    className="w-4 h-4 accent-[#00B050] rounded cursor-pointer disabled:opacity-70"
                   />
                 </label>
 
@@ -1280,22 +1630,67 @@ export const AiPresenterStudioModal: React.FC<AiPresenterStudioModalProps> = ({
                     className="w-full max-h-64 rounded-xl bg-black"
                   />
 
-                  <label className="flex flex-col gap-1">
-                    <span className="text-[11px] font-bold text-[var(--ptxt)]">
-                      موضع الإدراج في مشروع الفيديو:
-                    </span>
-                    <select
-                      value={insertScope}
-                      onChange={(e) => setInsertScope(e.target.value as AiPresenterScope)}
-                      className="px-2.5 py-2 rounded-lg bg-[var(--panel)] border border-[var(--pline)] text-xs text-[var(--ptxt)]"
-                    >
-                      <option value="intro">في المقدمة فقط</option>
-                      <option value="slide">في السؤال الحالي فقط</option>
-                      <option value="fullTimeline">طوال الفيديو (مستمر)</option>
-                      <option value="allSlides">في كل سؤال</option>
-                      <option value="outro">في الخاتمة فقط</option>
-                    </select>
-                  </label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <label className="flex flex-col gap-1">
+                      <span className="text-[11px] font-bold text-[var(--ptxt)]">
+                        موضع الإدراج في مشروع الفيديو:
+                      </span>
+                      <select
+                        value={insertScope}
+                        onChange={(e) => {
+                          const sc = e.target.value as AiPresenterScope;
+                          setInsertScope(sc);
+                          setAfterSpeechBehavior(
+                            sc === 'fullTimeline' || sc === 'allSlides' ? 'stayIdle' : 'hide'
+                          );
+                        }}
+                        className="px-2.5 py-2 rounded-lg bg-[var(--panel)] border border-[var(--pline)] text-xs text-[var(--ptxt)]"
+                      >
+                        <option value="fullTimeline">طوال الفيديو (مستمر)</option>
+                        <option value="allSlides">في كل سؤال</option>
+                        <option value="slide">في السؤال الحالي فقط</option>
+                        <option value="intro">في المقدمة فقط</option>
+                        <option value="outro">في الخاتمة فقط</option>
+                      </select>
+                    </label>
+
+                    <label className="flex flex-col gap-1">
+                      <span className="text-[11px] font-bold text-[var(--ptxt)]">
+                        بعد انتهاء كلام المقطع:
+                      </span>
+                      <select
+                        value={afterSpeechBehavior}
+                        onChange={(e) =>
+                          setAfterSpeechBehavior(
+                            e.target.value as 'stayIdle' | 'loop' | 'hide'
+                          )
+                        }
+                        className="px-2.5 py-2 rounded-lg bg-[var(--panel)] border border-[var(--pline)] text-xs text-[var(--ptxt)]"
+                      >
+                        <option value="stayIdle">يبقى ظاهراً على الشاشة</option>
+                        <option value="loop">تكرار مستمر طوال الفيديو</option>
+                        <option value="hide">يختفي عند الانتهاء</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  {insertScope === 'fullTimeline' && template.showIntroHook && (
+                    <label className="flex flex-col gap-1">
+                      <span className="text-[11px] font-bold text-[var(--ptxt)]">
+                        توقيت بدء كلام الراوي:
+                      </span>
+                      <select
+                        value={startPhase}
+                        onChange={(e) =>
+                          setStartPhase(e.target.value as 'timelineStart' | 'firstQuestion')
+                        }
+                        className="px-2.5 py-2 rounded-lg bg-[var(--panel)] border border-[var(--pline)] text-xs text-[var(--ptxt)]"
+                      >
+                        <option value="timelineStart">من بداية الفيديو (المقدمة)</option>
+                        <option value="firstQuestion">عند بدء السؤال الأول</option>
+                      </select>
+                    </label>
+                  )}
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                     <button

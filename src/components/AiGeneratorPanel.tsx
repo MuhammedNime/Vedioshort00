@@ -22,6 +22,7 @@ import {
   Sparkles,
   Square,
   Trash2,
+  Video,
   Volume2,
 } from 'lucide-react';
 import { soundEngine } from '../audio/soundEngine';
@@ -72,6 +73,9 @@ interface AiGeneratorPanelProps {
   voiceName: AiVoiceName;
   existingQuestions?: string[];
   vaultRefreshTrigger?: number;
+  aiPresenterConfigured?: boolean;
+  hasAiPresenter?: boolean;
+  onOpenAiPresenterStudio?: () => void;
   onOpenLargeVault?: () => void;
   onVoiceChange: (voice: AiVoiceName) => void;
   onInsertSlides: (
@@ -187,6 +191,9 @@ export const AiGeneratorPanel: React.FC<AiGeneratorPanelProps> = ({
   voiceName,
   existingQuestions = [],
   vaultRefreshTrigger = 0,
+  aiPresenterConfigured = false,
+  hasAiPresenter = false,
+  onOpenAiPresenterStudio,
   onOpenLargeVault,
   onVoiceChange,
   onInsertSlides,
@@ -681,6 +688,30 @@ export const AiGeneratorPanel: React.FC<AiGeneratorPanelProps> = ({
             </span>
           )}
         </div>
+
+        {onOpenAiPresenterStudio && (
+          <button
+            type="button"
+            onClick={onOpenAiPresenterStudio}
+            className="flex items-center justify-between gap-2 w-full px-3 py-2.5 rounded-xl bg-gradient-to-l from-[#00B050]/18 via-[var(--surface)] to-[#d4a73a]/12 hover:border-[#00B050] border border-[#00B050]/50 text-xs font-extrabold text-[var(--ptxt)] transition-colors cursor-pointer"
+          >
+            <span className="flex items-center gap-2 min-w-0">
+              <Video className="w-4 h-4 text-[#00B050] shrink-0" />
+              <span className="truncate">استوديو الراوي الذكي البشري (Tavus AI Presenter)</span>
+            </span>
+            <span
+              className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
+                hasAiPresenter
+                  ? 'bg-[#00B050] text-white'
+                  : aiPresenterConfigured
+                    ? 'bg-[#00B050]/18 text-[#00B050] dark:text-[#6ee7b7] border border-[#00B050]/40'
+                    : 'bg-[var(--panel)] text-[var(--pmuted)] border border-[var(--pline)]'
+              }`}
+            >
+              {hasAiPresenter ? 'مُدرج ✓' : aiPresenterConfigured ? 'متصل ✓ · افتح' : 'فتح'}
+            </span>
+          </button>
+        )}
 
         {onOpenLargeVault && (
           <button

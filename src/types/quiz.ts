@@ -186,6 +186,7 @@ export type PresenterLipSyncMode = 'audioOnly' | 'audioAndReading';
 
 export type PresenterPlacement =
   | 'cornerBottomRight'
+  | 'bottomCenter'
   | 'cornerBottomLeft'
   | 'topRight'
   | 'topLeft'
@@ -531,8 +532,13 @@ export interface TemplateSettings {
   introFlashHookText?: string;
   showLiveScoreboard?: boolean;
   scoreBoardLabel?: string;
+  showDynamicCaptions?: boolean;
+  dynamicCaptionStyle?: DynamicCaptionStyle;
+  dynamicCaptionY?: number;
   aiPresenter?: AiPresenterOverlay;
 }
+
+export type DynamicCaptionStyle = 'pillKaraoke' | 'boldYellow' | 'cleanGlass';
 
 export type AiPresenterBgMode =
   | 'original'
@@ -580,6 +586,9 @@ export interface AiPresenterOverlay {
   displayName?: string;
   fullscreenInIntro?: boolean;
   fullscreenInOutro?: boolean;
+  muteOtherVoices?: boolean;
+  afterSpeechBehavior?: 'stayIdle' | 'loop' | 'hide';
+  startPhase?: 'timelineStart' | 'firstQuestion';
 }
 
 export interface TimingSettings {
@@ -1768,19 +1777,22 @@ export const DEFAULT_TEMPLATE: TemplateSettings = {
   presenterBeard: 'trimmed',
   presenterGlasses: false,
   presenterCommands: {
-    intro: 'waveSpeak',
-    readingQuestion: 'pointUp',
-    readingOptions: 'explain',
-    thinking: 'thinkForehead',
-    suspense: 'leanSuspense',
-    reveal: 'celebrate',
-    outro: 'pointSubscribe',
+    intro: 'auto',
+    readingQuestion: 'auto',
+    readingOptions: 'auto',
+    thinking: 'auto',
+    suspense: 'auto',
+    reveal: 'auto',
+    outro: 'auto',
   },
 
   introFlashTeaser: false,
   introFlashHookText: '92% يغلطون في السؤال الأخير! ⚠️',
   showLiveScoreboard: false,
   scoreBoardLabel: 'تحدي الذكاء',
+  showDynamicCaptions: false,
+  dynamicCaptionStyle: 'pillKaraoke',
+  dynamicCaptionY: 85,
 };
 
 export const DEFAULT_TIMING: TimingSettings = {
@@ -2077,7 +2089,7 @@ export function getIntroHookDuration(
 ): number {
   if (!template?.showIntroHook) return 0;
   const rawDur = Number(template.introHookDuration ?? 1.2);
-  const baseDur = Math.max(0.5, Math.min(8.0, Number.isFinite(rawDur) ? rawDur : 1.2));
+  const baseDur = Math.max(0.5, Math.min(30.0, Number.isFinite(rawDur) ? rawDur : 1.2));
   const auto = timing?.autoSyncWithAudio ?? true;
   const audioDur = template.introHookAudio?.duration ?? 0;
   if (auto && audioDur > 0) {
@@ -2124,4 +2136,146 @@ export function getTotalDuration(
   const contentDur = getSlidesContentDuration(slides, timing, audio, template);
   if (contentDur <= 0) return 0;
   return contentDur + getEndCardDuration(template, timing);
+}
+
+export interface ChannelStarterKit {
+  id: string;
+  title: string;
+  subtitle: string;
+  emoji: string;
+  accentColor: string;
+  presetId: PresetId;
+  templatePatch: Partial<TemplateSettings>;
+  timingPatch: Partial<TimingSettings>;
+}
+
+export const CHANNEL_STARTER_KITS: ChannelStarterKit[] = [
+  {
+    id: 'islamicHeritage',
+    title: 'هوية القناة الإسلامية التراثية',
+    subtitle: 'خط أميري، كابشن أنيق، مؤقت كلاسيكي ومدة تفكير مريحة',
+    emoji: '🕌',
+    accentColor: '#eab308',
+    presetId: 'islamicAndalusian',
+    templatePatch: {
+      fontFamily: 'Amiri',
+      boxStyle: 'layeredCard',
+      borderStyle: 'gradientGold',
+      timerStyle: 'hexBadge',
+      showProgressCounter: true,
+      showEndSubscribeCta: true,
+      endCardText: 'بارك الله فيكم.. شاركونا نتيجتكم في التعليقات',
+      showDynamicCaptions: true,
+      dynamicCaptionStyle: 'cleanGlass',
+      dynamicCaptionY: 85,
+      revealConfetti: false,
+    },
+    timingPatch: {
+      thinkingDuration: 5,
+      suspenseDuration: 1.5,
+      revealHoldDuration: 3.2,
+    },
+  },
+  {
+    id: 'fastViralChallenge',
+    title: 'تحدي شورتس سريع وحماسي',
+    subtitle: 'نيون، مؤقت يتسارع، كابشن أصفر بارز ومذيع تفاعلي',
+    emoji: '⚡',
+    accentColor: '#22d3ee',
+    presetId: 'neonCyber',
+    templatePatch: {
+      fontFamily: 'Cairo',
+      boxStyle: 'neon',
+      borderStyle: 'gradientNeon',
+      timerStyle: 'neonRing',
+      showProgressCounter: true,
+      showLiveScoreboard: true,
+      scoreBoardLabel: 'تحدي الثواني',
+      introFlashTeaser: true,
+      introFlashHookText: '90% يخطئون في السؤال الأخير! 🔥',
+      showEndSubscribeCta: true,
+      showDynamicCaptions: true,
+      dynamicCaptionStyle: 'boldYellow',
+      dynamicCaptionY: 85,
+      revealConfetti: true,
+      presenterEnabled: true,
+      presenterPlacement: 'cornerBottomRight',
+      presenterScale: 88,
+    },
+    timingPatch: {
+      thinkingDuration: 4,
+      escalatingSpeed: true,
+      escalatingStepSeconds: 0.5,
+      escalatingMinSeconds: 2,
+      suspenseDuration: 1.1,
+      revealHoldDuration: 2.6,
+    },
+  },
+  {
+    id: 'mathBoardAcademy',
+    title: 'أكاديمية الرياضيات والألغاز',
+    subtitle: 'سبورة خضراء، كابشن كاريوكي، إبراز الخيار وتوضيح الحل',
+    emoji: '🧮',
+    accentColor: '#EDD6A2',
+    presetId: 'channelMath',
+    templatePatch: {
+      fontFamily: 'Cairo',
+      timerStyle: 'circle',
+      showExplanationOnReveal: true,
+      showProgressCounter: true,
+      showDynamicCaptions: true,
+      dynamicCaptionStyle: 'pillKaraoke',
+      dynamicCaptionY: 86,
+      showEndSubscribeCta: true,
+      endCardText: 'اكتب نتيجتك من 4 في التعليقات!',
+    },
+    timingPatch: {
+      thinkingDuration: 6,
+      suspenseDuration: 1.2,
+      revealHoldDuration: 3.8,
+    },
+  },
+  {
+    id: 'millionaireShow',
+    title: 'برنامج المسابقات الذهبي',
+    subtitle: 'سلم جوائز، بطاقات سداسية، مؤقت ذهبي وتشويق تلفزيوني',
+    emoji: '💎',
+    accentColor: '#facc15',
+    presetId: 'millionaire',
+    templatePatch: {
+      fontFamily: 'Cairo',
+      showPrizeLadder: true,
+      prizeLadderStyle: 'topStrip',
+      timerStyle: 'pillCountdown',
+      highlightSpokenOption: true,
+      showDynamicCaptions: true,
+      dynamicCaptionStyle: 'pillKaraoke',
+      dynamicCaptionY: 86,
+      revealConfetti: true,
+      showEndSubscribeCta: true,
+    },
+    timingPatch: {
+      thinkingDuration: 5,
+      suspenseDuration: 2.0,
+      revealHoldDuration: 3.2,
+    },
+  },
+];
+
+export function applyChannelStarterKit(project: QuizProject, kitId: string): QuizProject {
+  const kit = CHANNEL_STARTER_KITS.find((k) => k.id === kitId);
+  if (!kit) return project;
+  const themed = applyStudioThemePreset(project.template, kit.presetId);
+  return {
+    ...project,
+    template: {
+      ...themed,
+      ...kit.templatePatch,
+    },
+    timing: {
+      ...project.timing,
+      ...kit.timingPatch,
+    },
+    updatedAt: Date.now(),
+  };
 }

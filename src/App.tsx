@@ -32,6 +32,7 @@ import { TemplateDesignPanel } from './components/TemplateDesignPanel';
 import { ThumbnailStudioModal } from './components/ThumbnailStudioModal';
 import { GoogleSignInButton, YouTubePublishPanel } from './components/YouTubePublishPanel';
 import { YoutubePublishKit } from './services/aiClient';
+import { fetchAiPresenterStatus } from './services/aiPresenterClient';
 import {
   YouTubeChannelInfo,
   YouTubePlaylistItem,
@@ -196,6 +197,7 @@ export default function App() {
   });
   const [isThumbStudioOpen, setIsThumbStudioOpen] = useState(false);
   const [isAiPresenterOpen, setIsAiPresenterOpen] = useState(false);
+  const [aiPresenterConfigured, setAiPresenterConfigured] = useState(false);
   const [customThumbnailBlob, setCustomThumbnailBlob] = useState<Blob | null>(null);
   const [customThumbnailPreviewUrl, setCustomThumbnailPreviewUrl] = useState<string | null>(null);
   const [isLocked, setIsLocked] = useState(() => isAppLockEnabled());
@@ -256,6 +258,18 @@ export default function App() {
           })
           .catch(() => {});
       });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void fetchAiPresenterStatus()
+      .then((st) => {
+        if (active) setAiPresenterConfigured(Boolean(st.configured));
+      })
+      .catch(() => {});
     return () => {
       active = false;
     };
@@ -919,12 +933,35 @@ export default function App() {
 
               <button
                 type="button"
+                onClick={() => setIsAiPresenterOpen(true)}
+                title="الراوي الذكي – AI Presenter (فيديو بشري حقيقي)"
+                className={`flex items-center gap-1 h-7 px-1.5 sm:px-2 rounded-lg border text-[11px] font-bold cursor-pointer whitespace-nowrap transition-colors ${
+                  project.template.aiPresenter?.enabled
+                    ? 'bg-[#00B050] border-[#00B050] text-white'
+                    : aiPresenterConfigured
+                      ? 'bg-[#00B050]/15 border-[#00B050]/55 text-[#00B050] dark:text-[#6ee7b7] hover:border-[#00B050]'
+                      : 'bg-[var(--surface)] border-[var(--pline)] text-[var(--ptxt)] hover:border-[var(--gold)]'
+                }`}
+              >
+                <Video className="w-3.5 h-3.5 shrink-0" />
+                <span>الراوي AI</span>
+                {(aiPresenterConfigured || project.template.aiPresenter?.enabled) && (
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                      project.template.aiPresenter?.enabled ? 'bg-white' : 'bg-[#00B050]'
+                    }`}
+                  />
+                )}
+              </button>
+
+              <button
+                type="button"
                 onClick={() => setIsProjectsOpen(true)}
                 title="مكتبة المشاريع المحفوظة"
                 className="flex items-center gap-1 h-7 px-2 rounded-lg bg-[var(--surface)] border border-[var(--pline)] hover:border-[#00B050] text-[11px] font-bold text-[#00B050] dark:text-[#6ee7b7] cursor-pointer whitespace-nowrap"
               >
                 <FolderOpen className="w-3.5 h-3.5" />
-                <span>المشاريع</span>
+                <span className="hidden sm:inline">المشاريع</span>
               </button>
 
               <div className="relative" ref={toolsMenuRef}>
@@ -1069,6 +1106,9 @@ export default function App() {
                 voiceName={project.preferredAiVoice ?? 'Kore'}
                 existingQuestions={project.slides.map((s) => s.question)}
                 vaultRefreshTrigger={vaultRefreshTrigger}
+                aiPresenterConfigured={aiPresenterConfigured}
+                hasAiPresenter={Boolean(project.template.aiPresenter?.enabled)}
+                onOpenAiPresenterStudio={() => setIsAiPresenterOpen(true)}
                 onOpenLargeVault={() => setIsVaultOpen(true)}
                 onVoiceChange={(voice) =>
                   updateProject((prev) => ({ ...prev, preferredAiVoice: voice }), true)
@@ -1407,6 +1447,7 @@ export default function App() {
         template={project.template}
         slides={project.slides}
         activeSlideIndex={activeSlideIndex}
+        onConnectionChecked={(configured) => setAiPresenterConfigured(configured)}
         onUpdateTemplate={(next, immediate = true) =>
           updateProject((prev) => ({ ...prev, template: next }), immediate)
         }

@@ -28,8 +28,10 @@ import {
   renderQuizFrame,
 } from './quizRenderer';
 import {
+  isTimeCoveredByAiPresenterAudio,
   pauseAllCachedAiPresenterVideos,
   preloadAiPresenterMedia,
+  prepareAiPresenterPlaybackAt,
   seekAiPresenterVideoForExportFrame,
   syncAiPresenterPreviewVideo,
 } from './aiPresenterMedia';
@@ -1195,6 +1197,10 @@ export async function exportQuizVideo(
     let bgSource: AudioBufferSourceNode | null = null;
     let masterSource: AudioBufferSourceNode | null = null;
 
+    if (sTemplate.aiPresenter?.enabled && sTemplate.aiPresenter?.mediaKey) {
+      await prepareAiPresenterPlaybackAt(0, sSlides, sTemplate, timing, sAudio);
+    }
+
     let wakeLock: { release: () => Promise<void> } | null = null;
     try {
       const wl = (navigator as unknown as {
@@ -1337,23 +1343,24 @@ export async function exportQuizVideo(
           const ev = item.event;
           const slide = sSlides[ev.slideIndex];
           const maxDur = item.maxDuration;
+          const aiOwnsVoice = isTimeCoveredByAiPresenterAudio(item.time, sSlides, sTemplate, timing, sAudio);
 
           if (ev.type === 'introHook') {
             const hookSfx = sTemplate.introHookSfx ?? 'whoosh';
-            const hasHookVoice = Boolean(sTemplate.introHookAudio?.dataUrl);
+            const hasHookVoice = Boolean(sTemplate.introHookAudio?.dataUrl) && !aiOwnsVoice;
             if (hookSfx && hookSfx !== 'none') {
               soundEngine.playBuiltInSfx(
                 hookSfx,
-                hasHookVoice ? 0.42 : 0.72,
+                aiOwnsVoice ? 0.28 : hasHookVoice ? 0.42 : 0.72,
                 sharedAudioCtx,
                 audioDest,
                 when,
                 false,
                 1.6,
-                hasHookVoice ? Math.min(0.28, maxDur ?? 0.28) : maxDur
+                aiOwnsVoice || hasHookVoice ? Math.min(0.24, maxDur ?? 0.24) : maxDur
               );
             }
-            if (sTemplate.introHookAudio?.dataUrl) {
+            if (sTemplate.introHookAudio?.dataUrl && !aiOwnsVoice) {
               void soundEngine.playClip(
                 sTemplate.introHookAudio,
                 1,
@@ -1365,7 +1372,7 @@ export async function exportQuizVideo(
               );
             }
           } else if (ev.type === 'questionEnter') {
-            if (slide?.voiceover?.question?.dataUrl) {
+            if (slide?.voiceover?.question?.dataUrl && !aiOwnsVoice) {
               void soundEngine.playClip(
                 slide.voiceover.question,
                 1,
@@ -1388,7 +1395,7 @@ export async function exportQuizVideo(
           } else if (ev.type === 'optionEnter') {
             const optIdx = ev.optionIndex ?? 0;
             const optClip = slide?.voiceover?.options?.[optIdx];
-            if (optClip?.dataUrl) {
+            if (optClip?.dataUrl && !aiOwnsVoice) {
               void soundEngine.playClip(
                 optClip,
                 1,
@@ -1428,7 +1435,7 @@ export async function exportQuizVideo(
               timing.suspenseDuration
             );
           } else if (ev.type === 'correctReveal') {
-            if (slide?.voiceover?.answer?.dataUrl) {
+            if (slide?.voiceover?.answer?.dataUrl && !aiOwnsVoice) {
               void soundEngine.playClip(
                 slide.voiceover.answer,
                 1,
@@ -1449,7 +1456,7 @@ export async function exportQuizVideo(
               );
             }
           } else if (ev.type === 'endCardEnter') {
-            if (sTemplate.endCardAudio?.dataUrl) {
+            if (sTemplate.endCardAudio?.dataUrl && !aiOwnsVoice) {
               void soundEngine.playClip(
                 sTemplate.endCardAudio,
                 1,

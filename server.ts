@@ -1,8 +1,12 @@
 import 'dotenv/config';
 import express from 'express';
+import { execFile } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
+import { Readable, Transform } from 'node:stream';
 import zlib from 'node:zlib';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
@@ -1827,6 +1831,39 @@ Return JSON object with fields:
     return parsed ? parsed.origin : null;
   };
 
+  let appReachableCache: { base: string; reachable: boolean; checkedAt: number } | null = null;
+  const checkAppUrlExternallyReachable = async (publicBase: string | null): Promise<boolean> => {
+    if (!publicBase) return false;
+    const now = Date.now();
+    if (
+      appReachableCache &&
+      appReachableCache.base === publicBase &&
+      now - appReachableCache.checkedAt < 60_000
+    ) {
+      return appReachableCache.reachable;
+    }
+    let reachable = false;
+    try {
+      const probe = await withTimeout(
+        fetch(`${publicBase}/api/ai-presenter/public-ping`, {
+          method: 'GET',
+          redirect: 'manual',
+        }),
+        2500,
+        'public-ping probe'
+      );
+      const ct = (probe.headers.get('content-type') || '').toLowerCase();
+      if (probe.status === 200 && ct.includes('application/json')) {
+        const j = (await probe.json().catch(() => null)) as { ok?: boolean } | null;
+        reachable = Boolean(j?.ok);
+      }
+    } catch {
+      reachable = false;
+    }
+    appReachableCache = { base: publicBase, reachable, checkedAt: now };
+    return reachable;
+  };
+
   const tempAudioStore = new Map<
     string,
     { buffer: Buffer; mimeType: string; expiresAt: number }
@@ -1952,16 +1989,23 @@ Return JSON object with fields:
     ]);
   };
 
-  app.get('/api/ai-presenter/status', (_req, res) => {
+  app.get('/api/ai-presenter/public-ping', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, service: 'ai-presenter' });
+  });
+
+  app.get('/api/ai-presenter/status', async (_req, res) => {
     const keys = getTavusApiKeys();
     const publicAppUrl = getPublicHttpsAppBase();
+    const canHostPublicMedia = await checkAppUrlExternallyReachable(publicAppUrl);
     res.json({
       ok: true,
       provider: 'tavus',
       providerName: 'Tavus Video API v2',
       configured: keys.length > 0,
       keyCount: keys.length,
-      canHostTempAudio: Boolean(publicAppUrl),
+      canHostTempAudio: canHostPublicMedia,
+      canHostTempMedia: canHostPublicMedia,
       freeTierSummary: {
         planName: 'Tavus Free Developer Plan ($0)',
         renews: 'monthly',
@@ -2132,6 +2176,9 @@ Return JSON object with fields:
       const rawAudioUrl = String(body.audio_url || '').trim();
       const rawAudioDataUrl = String(body.audio_data_url || '').trim();
 
+      const publicBase = getPublicHttpsAppBase();
+      const canHostPublicMedia = await checkAppUrlExternallyReachable(publicBase);
+
       let resolvedAudioUrl: string | undefined;
       if (rawAudioUrl) {
         const parsedAudio = isPublicHttpsUrl(rawAudioUrl);
@@ -2143,11 +2190,10 @@ Return JSON object with fields:
         }
         resolvedAudioUrl = parsedAudio.toString();
       } else if (rawAudioDataUrl) {
-        const publicBase = getPublicHttpsAppBase();
-        if (!publicBase) {
+        if (!publicBase || !canHostPublicMedia) {
           res.status(400).json({
             error:
-              'استخدام ملف صوت محلي مباشرة يتطلب استضافة الخادم على رابط HTTPS عام (APP_URL). استخدم خيار النطق التلقائي للنص (يدعم العربية) أو أدخل رابط HTTPS عاماً للصوت.',
+              'استضافة ملف الصوت المحلي مباشرة لـ Tavus تتطلب نشراً عاماً بدون تسجيل دخول. استخدم «نطق النص» أو أدخل رابط HTTPS عاماً للصوت.',
           });
           return;
         }
@@ -2164,7 +2210,6 @@ Return JSON object with fields:
           return;
         }
         purgeExpiredTempAudio();
-        const { randomBytes } = await import('node:crypto');
         const token = randomBytes(18).toString('hex');
         const mimeType = match[1].toLowerCase() === 'audio/mp3' ? 'audio/mpeg' : match[1].toLowerCase();
         tempAudioStore.set(token, {
@@ -2221,6 +2266,8 @@ Return JSON object with fields:
 
       if (wantTransparent) {
         tavusPayload.transparent_background = true;
+        // Tavus API v2 requires fast: true whenever transparent_background: true
+        tavusPayload.fast = true;
       } else if (requestedBgUrl) {
         const bgUrl = isPublicHttpsUrl(requestedBgUrl);
         if (!bgUrl) {
@@ -2229,49 +2276,44 @@ Return JSON object with fields:
         }
         tavusPayload.background_url = bgUrl.toString();
       } else if (requestedBgDataUrl) {
-        const publicBase = getPublicHttpsAppBase();
-        if (!publicBase) {
-          res.status(400).json({
-            error:
-              'تضمين صورة الخلفية مباشرة داخل Tavus يتطلب رابط خادم HTTPS عام (APP_URL). فعّل الخيار الشفاف ليتم دمج الخلفية تلقائياً داخل المحرر.',
+        if (publicBase && canHostPublicMedia) {
+          const imgMatch = requestedBgDataUrl.match(
+            /^data:(image\/(?:png|jpeg|jpg|webp));base64,([A-Za-z0-9+/=]+)$/i
+          );
+          if (!imgMatch) {
+            res.status(400).json({ error: 'صيغة صورة الخلفية المخصصة غير مدعومة (PNG / JPG / WebP فقط).' });
+            return;
+          }
+          const imgBuf = Buffer.from(imgMatch[2], 'base64');
+          if (imgBuf.length === 0 || imgBuf.length > 8 * 1024 * 1024) {
+            res.status(400).json({ error: 'حجم صورة الخلفية يتجاوز الحد المسموح (8MB).' });
+            return;
+          }
+          purgeExpiredTempBg();
+          const bgToken = randomBytes(18).toString('hex');
+          const imgMime = imgMatch[1].toLowerCase() === 'image/jpg' ? 'image/jpeg' : imgMatch[1].toLowerCase();
+          tempBgStore.set(bgToken, {
+            buffer: imgBuf,
+            mimeType: imgMime,
+            expiresAt: Date.now() + 15 * 60_000,
           });
-          return;
+          tavusPayload.background_url = `${publicBase}/api/ai-presenter/temp-bg/${bgToken}`;
+        } else {
+          // Dev preview is behind auth cookie check; fall back cleanly to transparent WebM so editor composites the image without Tavus fetch error
+          tavusPayload.transparent_background = true;
+          tavusPayload.fast = true;
         }
-        const imgMatch = requestedBgDataUrl.match(
-          /^data:(image\/(?:png|jpeg|jpg|webp));base64,([A-Za-z0-9+/=]+)$/i
-        );
-        if (!imgMatch) {
-          res.status(400).json({ error: 'صيغة صورة الخلفية المخصصة غير مدعومة (PNG / JPG / WebP فقط).' });
-          return;
-        }
-        const imgBuf = Buffer.from(imgMatch[2], 'base64');
-        if (imgBuf.length === 0 || imgBuf.length > 8 * 1024 * 1024) {
-          res.status(400).json({ error: 'حجم صورة الخلفية يتجاوز الحد المسموح (8MB).' });
-          return;
-        }
-        purgeExpiredTempBg();
-        const { randomBytes } = await import('node:crypto');
-        const bgToken = randomBytes(18).toString('hex');
-        const imgMime = imgMatch[1].toLowerCase() === 'image/jpg' ? 'image/jpeg' : imgMatch[1].toLowerCase();
-        tempBgStore.set(bgToken, {
-          buffer: imgBuf,
-          mimeType: imgMime,
-          expiresAt: Date.now() + 15 * 60_000,
-        });
-        tavusPayload.background_url = `${publicBase}/api/ai-presenter/temp-bg/${bgToken}`;
       } else if (
         (requestedBgMode === 'white' || requestedBgMode === 'color') &&
         requestedBgColor
       ) {
-        const publicBase = getPublicHttpsAppBase();
-        if (publicBase) {
+        if (publicBase && canHostPublicMedia) {
           const pngBuf = buildSolidColorPngBuffer(requestedBgColor);
           if (!pngBuf) {
             res.status(400).json({ error: 'صيغة لون الخلفية الثابت غير صالحة (استخدم #RRGGBB).' });
             return;
           }
           purgeExpiredTempBg();
-          const { randomBytes } = await import('node:crypto');
           const bgToken = randomBytes(18).toString('hex');
           tempBgStore.set(bgToken, {
             buffer: pngBuf,
@@ -2282,6 +2324,7 @@ Return JSON object with fields:
         } else {
           // Fallback to alpha transparency so the editor composites the exact solid color cleanly
           tavusPayload.transparent_background = true;
+          tavusPayload.fast = true;
         }
       }
 
@@ -2332,6 +2375,91 @@ Return JSON object with fields:
           err instanceof Error
             ? `تعذر إرسال طلب توليد الراوي إلى Tavus: ${err.message}`
             : 'تعذر الاتصال بخدمة Tavus.',
+      });
+    }
+  });
+
+  app.get('/api/ai-presenter/videos', async (_req, res) => {
+    const keys = getTavusApiKeys();
+    if (keys.length === 0) {
+      res.status(400).json({
+        missingKey: true,
+        error: 'مفتاح TAVUS_API_KEY غير مضبوط في Secrets.',
+      });
+      return;
+    }
+
+    try {
+      const apiRes = await withTimeout(
+        fetch('https://tavusapi.com/v2/videos?limit=15', {
+          method: 'GET',
+          headers: {
+            'x-api-key': keys[0],
+          },
+        }),
+        15_000,
+        'Tavus list videos'
+      );
+      const rawText = await apiRes.text();
+      if (!apiRes.ok) {
+        const formatted = formatTavusHttpError(apiRes.status, rawText);
+        res.status(formatted.status).json(formatted);
+        return;
+      }
+
+      const payload = JSON.parse(rawText) as {
+        data?: Array<{
+          video_id?: string;
+          video_name?: string;
+          status?: string;
+          status_details?: string;
+          generation_progress?: string;
+          download_url?: string;
+          stream_url?: string;
+          hosted_url?: string;
+          created_at?: string;
+        }>;
+      };
+
+      const videos = (Array.isArray(payload.data) ? payload.data : [])
+        .filter((v) => typeof v.video_id === 'string' && v.video_id.trim())
+        .map((v) => {
+          const downloadUrl = typeof v.download_url === 'string' ? v.download_url.trim() : '';
+          const streamUrl = typeof v.stream_url === 'string' ? v.stream_url.trim() : '';
+          return {
+            provider: 'tavus' as const,
+            videoId: v.video_id!.trim(),
+            videoName: (v.video_name || v.video_id || 'فيديو راوي').trim(),
+            status: (v.status || 'queued').trim(),
+            statusDetails: v.status_details || '',
+            generationProgress: v.generation_progress || '',
+            downloadUrl: downloadUrl || undefined,
+            streamUrl: streamUrl || undefined,
+            hostedUrl: v.hosted_url || undefined,
+            createdAt: v.created_at,
+            proxiedDownloadUrl:
+              downloadUrl && isAllowedMediaProxyUrl(downloadUrl)
+                ? `/api/ai-presenter/media?url=${encodeURIComponent(downloadUrl)}${
+                    downloadUrl.toLowerCase().includes('.webm') ? '' : '&optimize=1'
+                  }`
+                : undefined,
+            proxiedStreamUrl:
+              streamUrl && isAllowedMediaProxyUrl(streamUrl)
+                ? `/api/ai-presenter/media?url=${encodeURIComponent(streamUrl)}`
+                : undefined,
+          };
+        });
+
+      res.json({
+        provider: 'tavus',
+        videos,
+      });
+    } catch (err) {
+      res.status(502).json({
+        error:
+          err instanceof Error
+            ? `تعذر جلب سجل الفيديوهات من Tavus: ${err.message}`
+            : 'تعذر جلب سجل الفيديوهات.',
       });
     }
   });
@@ -2394,7 +2522,9 @@ Return JSON object with fields:
         hostedUrl: data.hosted_url || undefined,
         proxiedDownloadUrl:
           downloadUrl && isAllowedMediaProxyUrl(downloadUrl)
-            ? `/api/ai-presenter/media?url=${encodeURIComponent(downloadUrl)}`
+            ? `/api/ai-presenter/media?url=${encodeURIComponent(downloadUrl)}${
+                downloadUrl.toLowerCase().includes('.webm') ? '' : '&optimize=1'
+              }`
             : undefined,
         proxiedStreamUrl:
           streamUrl && isAllowedMediaProxyUrl(streamUrl)
@@ -2411,12 +2541,234 @@ Return JSON object with fields:
     }
   });
 
+  const mediaOptCacheDir = path.join(os.tmpdir(), 'sv0_ai_media_cache');
+  const inflightMediaOptimize = new Map<string, Promise<{ filePath: string; mimeType: string } | null>>();
+
+  const execFileAsync = (cmd: string, args: string[], timeoutMs = 45_000): Promise<string> =>
+    new Promise((resolve, reject) => {
+      execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err) {
+          reject(new Error(stderr || err.message));
+          return;
+        }
+        resolve(stdout);
+      });
+    });
+
+  const fetchAllowlistedBuffer = async (startUrl: URL, maxBytes: number): Promise<{ buffer: Buffer; mimeType: string } | null> => {
+    let curUrl: URL = startUrl;
+    let upstream: Response | null = null;
+    for (let hop = 0; hop < 3; hop++) {
+      const candidate = await withTimeout(
+        fetch(curUrl.toString(), { method: 'GET', redirect: 'manual' }),
+        35_000,
+        'Tavus media download'
+      );
+      if (candidate.status >= 300 && candidate.status < 400) {
+        const loc = candidate.headers.get('location');
+        if (!loc) break;
+        const nextParsed = isAllowedMediaProxyUrl(new URL(loc, curUrl).toString());
+        if (!nextParsed) return null;
+        curUrl = nextParsed;
+        continue;
+      }
+      upstream = candidate;
+      break;
+    }
+    if (!upstream || !upstream.ok) return null;
+    const len = Number(upstream.headers.get('content-length') || 0);
+    if (len > maxBytes) return null;
+    const arrBuf = await withTimeout(upstream.arrayBuffer(), 45_000, 'Tavus media body');
+    if (arrBuf.byteLength === 0 || arrBuf.byteLength > maxBytes) return null;
+    const rawCt = (upstream.headers.get('content-type') || '').toLowerCase();
+    const mimeType =
+      rawCt.includes('webm') || curUrl.pathname.toLowerCase().endsWith('.webm')
+        ? 'video/webm'
+        : 'video/mp4';
+    return { buffer: Buffer.from(arrBuf), mimeType };
+  };
+
+  const getOrOptimizeAiPresenterMp4 = async (
+    targetUrl: URL
+  ): Promise<{ filePath: string; mimeType: string } | null> => {
+    const key = createHash('sha256').update(targetUrl.toString()).digest('hex').slice(0, 32);
+    const cachedMp4 = path.join(mediaOptCacheDir, `${key}_opt.mp4`);
+    const cachedWebm = path.join(mediaOptCacheDir, `${key}_raw.webm`);
+    try {
+      if (fs.existsSync(cachedMp4) && fs.statSync(cachedMp4).size > 2048) {
+        return { filePath: cachedMp4, mimeType: 'video/mp4' };
+      }
+      if (fs.existsSync(cachedWebm) && fs.statSync(cachedWebm).size > 2048) {
+        return { filePath: cachedWebm, mimeType: 'video/webm' };
+      }
+    } catch {
+      // ignore stat errors
+    }
+
+    const existing = inflightMediaOptimize.get(key);
+    if (existing) return existing;
+
+    const job = (async (): Promise<{ filePath: string; mimeType: string } | null> => {
+      const rawTmp = path.join(mediaOptCacheDir, `${key}_raw_${Date.now()}.tmp`);
+      const optTmp = path.join(mediaOptCacheDir, `${key}_opt_${Date.now()}.mp4`);
+      try {
+        fs.mkdirSync(mediaOptCacheDir, { recursive: true });
+        const downloaded = await fetchAllowlistedBuffer(targetUrl, 90 * 1024 * 1024);
+        if (!downloaded) return null;
+        if (downloaded.mimeType === 'video/webm') {
+          fs.writeFileSync(cachedWebm, downloaded.buffer);
+          return { filePath: cachedWebm, mimeType: 'video/webm' };
+        }
+        fs.writeFileSync(rawTmp, downloaded.buffer);
+
+        let needsTranscode = true;
+        try {
+          const probeJson = await execFileAsync(
+            'ffprobe',
+            ['-v', 'quiet', '-print_format', 'json', '-show_streams', rawTmp],
+            8000
+          );
+          const parsed = JSON.parse(probeJson) as {
+            streams?: Array<{
+              codec_type?: string;
+              codec_name?: string;
+              pix_fmt?: string;
+              width?: number;
+              has_b_frames?: number;
+            }>;
+          };
+          const vStream = (parsed.streams || []).find((s) => s.codec_type === 'video');
+          if (
+            vStream &&
+            vStream.codec_name === 'h264' &&
+            (vStream.width ?? 0) <= 960 &&
+            (vStream.has_b_frames ?? 1) === 0 &&
+            !String(vStream.pix_fmt || '').includes('yuva')
+          ) {
+            needsTranscode = false;
+          }
+        } catch {
+          needsTranscode = true;
+        }
+
+        if (!needsTranscode) {
+          fs.renameSync(rawTmp, cachedMp4);
+          return { filePath: cachedMp4, mimeType: 'video/mp4' };
+        }
+
+        try {
+          // Zero B-frames + tight GOP (15 frames = 0.6s) + <=960p width + faststart ensures instant A/V locked seeking across Android & WebCodecs
+          await execFileAsync(
+            'ffmpeg',
+            [
+              '-y',
+              '-i',
+              rawTmp,
+              '-vf',
+              "scale='min(960,iw)':-2:flags=lanczos",
+              '-c:v',
+              'libx264',
+              '-profile:v',
+              'main',
+              '-preset',
+              'veryfast',
+              '-crf',
+              '20',
+              '-pix_fmt',
+              'yuv420p',
+              '-bf',
+              '0',
+              '-g',
+              '15',
+              '-keyint_min',
+              '15',
+              '-sc_threshold',
+              '0',
+              '-c:a',
+              'aac',
+              '-b:a',
+              '128k',
+              '-ac',
+              '2',
+              '-ar',
+              '44100',
+              '-movflags',
+              '+faststart',
+              optTmp,
+            ],
+            45_000
+          );
+          if (fs.existsSync(optTmp) && fs.statSync(optTmp).size > 2048) {
+            fs.renameSync(optTmp, cachedMp4);
+            try {
+              fs.unlinkSync(rawTmp);
+            } catch {
+              // ignore
+            }
+            return { filePath: cachedMp4, mimeType: 'video/mp4' };
+          }
+        } catch {
+          // Fall back to raw MP4 if ffmpeg transcode fails
+        }
+
+        fs.renameSync(rawTmp, cachedMp4);
+        return { filePath: cachedMp4, mimeType: 'video/mp4' };
+      } catch {
+        return null;
+      } finally {
+        for (const p of [rawTmp, optTmp]) {
+          try {
+            if (fs.existsSync(p)) fs.unlinkSync(p);
+          } catch {
+            // ignore
+          }
+        }
+        inflightMediaOptimize.delete(key);
+      }
+    })();
+
+    inflightMediaOptimize.set(key, job);
+    return job;
+  };
+
   app.get('/api/ai-presenter/media', async (req, res) => {
     const rawUrl = typeof req.query.url === 'string' ? req.query.url : '';
     let currentUrl = isAllowedMediaProxyUrl(rawUrl);
     if (!currentUrl) {
       res.status(400).json({ error: 'رابط الوسائط غير مصرح به أو غير صالح.' });
       return;
+    }
+
+    if (req.query.optimize === '1' && !currentUrl.pathname.toLowerCase().endsWith('.webm')) {
+      const opt = await getOrOptimizeAiPresenterMp4(currentUrl);
+      if (opt && fs.existsSync(opt.filePath)) {
+        const stat = fs.statSync(opt.filePath);
+        const totalSize = stat.size;
+        res.setHeader('Content-Type', opt.mimeType);
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Cache-Control', 'private, max-age=3600');
+        const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range.trim() : '';
+        const rangeMatch = rangeHeader.match(/^bytes=(\d+)-(\d*)$/i);
+        if (rangeMatch) {
+          const start = Math.min(totalSize - 1, Math.max(0, parseInt(rangeMatch[1], 10) || 0));
+          const end = rangeMatch[2]
+            ? Math.min(totalSize - 1, Math.max(start, parseInt(rangeMatch[2], 10) || totalSize - 1))
+            : totalSize - 1;
+          res.status(206);
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+          res.setHeader('Content-Length', String(end - start + 1));
+          const rs = fs.createReadStream(opt.filePath, { start, end });
+          req.on('close', () => rs.destroy());
+          rs.pipe(res);
+          return;
+        }
+        res.status(200);
+        res.setHeader('Content-Length', String(totalSize));
+        const rs = fs.createReadStream(opt.filePath);
+        req.on('close', () => rs.destroy());
+        rs.pipe(res);
+        return;
+      }
     }
 
     try {
@@ -2463,7 +2815,14 @@ Return JSON object with fields:
         return;
       }
 
-      const ct = upstream.headers.get('content-type') || 'video/mp4';
+      const rawCt = (upstream.headers.get('content-type') || '').toLowerCase();
+      const isGenericBinary = !rawCt || rawCt.includes('octet-stream');
+      const ct = isGenericBinary
+        ? currentUrl.pathname.toLowerCase().endsWith('.webm')
+          ? 'video/webm'
+          : 'video/mp4'
+        : upstream.headers.get('content-type') || 'video/mp4';
+
       res.status(upstream.status);
       res.setHeader('Content-Type', ct);
       const acceptRanges = upstream.headers.get('accept-ranges');
@@ -2473,16 +2832,48 @@ Return JSON object with fields:
       if (contentLen > 0) res.setHeader('Content-Length', String(contentLen));
       res.setHeader('Cache-Control', 'private, max-age=3600');
 
-      const arrBuf = await upstream.arrayBuffer();
-      if (arrBuf.byteLength > 90 * 1024 * 1024) {
-        res.status(413).end();
-        return;
+      const maxBytes = 90 * 1024 * 1024;
+      if (upstream.body) {
+        let streamedBytes = 0;
+        const limiter = new Transform({
+          transform(chunk: Buffer, _enc, cb) {
+            streamedBytes += chunk.length;
+            if (streamedBytes > maxBytes) {
+              cb(new Error('Media exceeded 90MB limit'));
+              return;
+            }
+            cb(null, chunk);
+          },
+        });
+        const nodeStream = Readable.fromWeb(upstream.body as unknown as import('node:stream/web').ReadableStream);
+        nodeStream.on('error', () => {
+          if (!res.headersSent) res.status(502).end();
+          else res.destroy();
+        });
+        limiter.on('error', () => {
+          nodeStream.destroy();
+          if (!res.headersSent) res.status(413).end();
+          else res.destroy();
+        });
+        req.on('close', () => {
+          nodeStream.destroy();
+          limiter.destroy();
+        });
+        nodeStream.pipe(limiter).pipe(res);
+      } else {
+        const arrBuf = await upstream.arrayBuffer();
+        if (arrBuf.byteLength > maxBytes) {
+          res.status(413).end();
+          return;
+        }
+        res.send(Buffer.from(arrBuf));
       }
-      res.send(Buffer.from(arrBuf));
     } catch (err) {
-      res.status(502).json({
-        error: err instanceof Error ? `فشل تحميل الوسائط: ${err.message}` : 'فشل تحميل الوسائط.',
-      });
+      if (!res.headersSent) {
+        res.status(502).json({
+          error: err instanceof Error ? `فشل تحميل الوسائط: ${err.message}` : 'فشل تحميل الوسائط.',
+        });
+      }
     }
   });
 

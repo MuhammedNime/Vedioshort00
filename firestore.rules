@@ -147,6 +147,74 @@ service cloud.firestore {
         data.serverUpdatedAt is timestamp;
     }
 
+    function isValidCloudProject(data, userId, projectId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerId',
+          'name',
+          'schemaVersion',
+          'preferredAiVoice',
+          'aspectRatio',
+          'slideCount',
+          'projectJson',
+          'updatedAt',
+          'serverUpdatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'ownerId',
+          'name',
+          'schemaVersion',
+          'preferredAiVoice',
+          'aspectRatio',
+          'slideCount',
+          'projectJson',
+          'updatedAt',
+          'serverUpdatedAt'
+        ]) &&
+        data.id is string && data.id == projectId && isValidId(data.id) &&
+        data.ownerId is string && data.ownerId == userId && data.ownerId == request.auth.uid &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.schemaVersion is int && data.schemaVersion >= 1 && data.schemaVersion <= 30 &&
+        data.preferredAiVoice in ['Kore', 'Puck', 'Charon', 'Fenrir', 'Zephyr'] &&
+        data.aspectRatio in ['9:16', '16:9'] &&
+        data.slideCount is int && data.slideCount >= 1 && data.slideCount <= 50 &&
+        data.projectJson is string && data.projectJson.size() >= 10 && data.projectJson.size() <= 650000 &&
+        data.updatedAt is int && data.updatedAt >= 0 &&
+        data.serverUpdatedAt is timestamp;
+    }
+
+    function isValidCloudStylePreset(data, userId, presetId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerId',
+          'name',
+          'createdAt',
+          'updatedAt',
+          'includesMedia',
+          'presetJson',
+          'serverUpdatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'ownerId',
+          'name',
+          'createdAt',
+          'updatedAt',
+          'includesMedia',
+          'presetJson',
+          'serverUpdatedAt'
+        ]) &&
+        data.id is string && data.id == presetId && isValidId(data.id) &&
+        data.ownerId is string && data.ownerId == userId && data.ownerId == request.auth.uid &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.createdAt is int && data.createdAt >= 0 &&
+        data.updatedAt is int && data.updatedAt >= 0 &&
+        data.includesMedia is bool &&
+        data.presetJson is string && data.presetJson.size() >= 2 && data.presetJson.size() <= 150000 &&
+        data.serverUpdatedAt is timestamp;
+    }
+
     // 4. User Profile Collection (PII isolated strictly to owner)
     match /users/{userId} {
       allow get: if isOwner(userId) && isValidId(userId);
@@ -240,6 +308,70 @@ service cloud.firestore {
             ])
           );
         allow delete: if isOwner(userId) && isValidId(userId) && isValidId(questionId);
+      }
+
+      // 7. Synced Quiz Projects Subcollection
+      match /projects/{projectId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(projectId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(projectId) &&
+          isValidCloudProject(incoming(), userId, projectId) &&
+          incoming().serverUpdatedAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(projectId) &&
+          isValidCloudProject(incoming(), userId, projectId) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().serverUpdatedAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId)) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name',
+            'schemaVersion',
+            'preferredAiVoice',
+            'aspectRatio',
+            'slideCount',
+            'projectJson',
+            'updatedAt',
+            'serverUpdatedAt'
+          ]);
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(projectId);
+      }
+
+      // 8. Synced Custom Style Presets Subcollection
+      match /presets/{presetId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(presetId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(presetId) &&
+          isValidCloudStylePreset(incoming(), userId, presetId) &&
+          incoming().serverUpdatedAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if isVerifiedUser() &&
+          isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(presetId) &&
+          isValidCloudStylePreset(incoming(), userId, presetId) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().serverUpdatedAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId)) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name',
+            'updatedAt',
+            'includesMedia',
+            'presetJson',
+            'serverUpdatedAt'
+          ]);
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(presetId);
       }
     }
   }
